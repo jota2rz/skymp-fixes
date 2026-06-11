@@ -58,13 +58,28 @@ static bool IsInModule(uintptr_t addr) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// FIX 1: FaceGen Crash
+// FIX 1: FaceGen Crash (two variants)
 // ════════════════════════════════════════════════════════════════════════════
+
+// Variant A: Corrupted vtable jump — RIP lands at garbage address,
+//   stack has face gen return addresses.
+// Variant B: Invalid pointer in face gen helper — RIP is valid but a register
+//   holds 0xFFFFFFFF (error sentinel from failed resource lookup).
+//   Crash site: +0429E69 mov byte ptr [rdi+0x1C], 0x01 with RDI=0xFFFFFFFF
+//   This is in function 26789 (face gen morph apply helper).
 
 static bool IsInFaceGenRange(uintptr_t addr) {
     uintptr_t offset = addr - g_baseAddr;
-    return offset >= 0x42B800 && offset <= 0x42F000;
+    return offset >= 0x429000 && offset <= 0x42F000;
 }
+
+// Direct crash sites for Variant B (valid RIP, bad register)
+static constexpr uintptr_t kFaceGenDirectOffsets[] = {
+    0x0429E69,  // mov byte ptr [rdi+0x1C], 0x01 — RDI=0xFFFFFFFF
+};
+static constexpr uint32_t kFaceGenDirectInsnLen[] = {
+    4,          // C6 47 1C 01 = 4 bytes
+};
 
 static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     const auto* rec = a_ex->ExceptionRecord;
@@ -72,6 +87,39 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
 
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
+
+    // Variant B: known crash sites with invalid register values
+    for (size_t i = 0; i < sizeof(kFaceGenDirectOffsets)/sizeof(kFaceGenDirectOffsets[0]); i++) {
+        if (ctx->Rip == g_baseAddr + kFaceGenDirectOffsets[i]) {
+            // RDI = 0xFFFFFFFF means resource lookup returned "not found".
+            // Skip the write and unwind to the caller of the face gen chain.
+            uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+            uintptr_t safeReturn = 0;
+            uintptr_t safeRsp = 0;
+
+            for (int j = 0; j < 64; j++) {
+                uintptr_t val = stack[j];
+                if (IsInModule(val) && !IsInFaceGenRange(val)) {
+                    safeReturn = val;
+                    safeRsp = ctx->Rsp + (j + 1) * 8;
+                    break;
+                }
+            }
+
+            if (safeReturn) {
+                ctx->Rip = safeReturn;
+                ctx->Rsp = safeRsp;
+                ctx->Rax = 0;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            // Fallback: just skip the faulting instruction
+            ctx->Rip += kFaceGenDirectInsnLen[i];
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    // Variant A: RIP at garbage address (corrupted vtable jump)
 
     uintptr_t faultAddr = ctx->Rip;
 
