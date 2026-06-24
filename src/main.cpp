@@ -9,6 +9,9 @@
 //    dereferences uninitialized data and jumps to an invalid address.
 //    Crash signature: RIP at garbage address (e.g. 0x000003480001),
 //    stack contains BSFaceGenNiNode*, BSFaceGenModel* etc.
+//    Also covers direct null-deref variants on the job-thread FaceGen
+//    pipeline (e.g. +0429E69, +04328E9) seen when BSFaceGenMorphDataHead
+//    is processed for a partially-loaded actor 3D.
 //
 // 2. WorldClean Crash Fix
 //    Prevents CTD from NPC deletion race condition during load.
@@ -64,21 +67,39 @@ static bool IsInModule(uintptr_t addr) {
 // Variant A: Corrupted vtable jump — RIP lands at garbage address,
 //   stack has face gen return addresses.
 // Variant B: Invalid pointer in face gen helper — RIP is valid but a register
-//   holds 0xFFFFFFFF (error sentinel from failed resource lookup).
-//   Crash site: +0429E69 mov byte ptr [rdi+0x1C], 0x01 with RDI=0xFFFFFFFF
-//   This is in function 26789 (face gen morph apply helper).
+//   holds an invalid/sentinel value (e.g. 0xFFFFFFFF from failed lookup, or
+//   simply NULL because the owning actor 3D was torn down on another thread).
+//   Known crash sites:
+//     +0429E69  mov byte ptr [rdi+0x1C], 0x01   RDI=0xFFFFFFFF  (fn 26789)
+//     +04328E9  mov rax, [rcx]                  RCX=0           (fn 26988)
+//   The second site is reached from the BSJobs::JobThread FaceGen pipeline
+//   (callers: +0CF61DA, +0CF7745, +0CF7888, +0CF7E51) when a queued morph
+//   job runs after the BSFaceGenMorphDataHead's referenced object has been
+//   freed (typical of SkyMP's rapid actor spawn/delete).
 
 static bool IsInFaceGenRange(uintptr_t addr) {
     uintptr_t offset = addr - g_baseAddr;
-    return offset >= 0x429000 && offset <= 0x42F000;
+    // Covers both the original Variant B site (~+0x429xxx) and the newer
+    // job-thread FaceGen helper around +0x4328E9 / +0x04334F8.
+    return offset >= 0x428000 && offset <= 0x434000;
 }
 
-// Direct crash sites for Variant B (valid RIP, bad register)
-static constexpr uintptr_t kFaceGenDirectOffsets[] = {
-    0x0429E69,  // mov byte ptr [rdi+0x1C], 0x01 — RDI=0xFFFFFFFF
+// Direct crash sites for Variant B (valid RIP, bad register).
+// Each entry: (offset, instruction length, expected-bad-register check).
+enum FaceGenBadRegKind : uint8_t {
+    kFGBadReg_RDI_FFFFFFFF = 0,  // RDI == 0xFFFFFFFF
+    kFGBadReg_RCX_Null     = 1,  // RCX == 0
 };
-static constexpr uint32_t kFaceGenDirectInsnLen[] = {
-    4,          // C6 47 1C 01 = 4 bytes
+
+struct FaceGenDirectSite {
+    uintptr_t          offset;
+    uint32_t           insnLen;
+    FaceGenBadRegKind  badReg;
+};
+
+static constexpr FaceGenDirectSite kFaceGenDirectSites[] = {
+    { 0x0429E69, 4, kFGBadReg_RDI_FFFFFFFF }, // C6 47 1C 01           — mov byte [rdi+0x1C], 1
+    { 0x04328E9, 3, kFGBadReg_RCX_Null     }, // 48 8B 01              — mov rax, [rcx]
 };
 
 static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
@@ -89,34 +110,48 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         return EXCEPTION_CONTINUE_SEARCH;
 
     // Variant B: known crash sites with invalid register values
-    for (size_t i = 0; i < sizeof(kFaceGenDirectOffsets)/sizeof(kFaceGenDirectOffsets[0]); i++) {
-        if (ctx->Rip == g_baseAddr + kFaceGenDirectOffsets[i]) {
-            // RDI = 0xFFFFFFFF means resource lookup returned "not found".
-            // Skip the write and unwind to the caller of the face gen chain.
-            uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
-            uintptr_t safeReturn = 0;
-            uintptr_t safeRsp = 0;
+    for (const auto& site : kFaceGenDirectSites) {
+        if (ctx->Rip != g_baseAddr + site.offset)
+            continue;
 
-            for (int j = 0; j < 64; j++) {
-                uintptr_t val = stack[j];
-                if (IsInModule(val) && !IsInFaceGenRange(val)) {
-                    safeReturn = val;
-                    safeRsp = ctx->Rsp + (j + 1) * 8;
-                    break;
-                }
+        // Confirm the expected bad-register condition. If something else
+        // triggered the AV at this address, fall through to the other
+        // handlers rather than masking an unrelated bug.
+        bool matches = false;
+        switch (site.badReg) {
+            case kFGBadReg_RDI_FFFFFFFF: matches = (ctx->Rdi == 0xFFFFFFFFu); break;
+            case kFGBadReg_RCX_Null:     matches = (ctx->Rcx == 0);            break;
+        }
+        if (!matches)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        // Unwind to the first stack-frame return address that lives outside
+        // the FaceGen helper range — that caller is prepared to handle a
+        // "not found / null" result from this helper chain.
+        uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+        uintptr_t safeReturn = 0;
+        uintptr_t safeRsp = 0;
+
+        for (int j = 0; j < 64; j++) {
+            uintptr_t val = stack[j];
+            if (IsInModule(val) && !IsInFaceGenRange(val)) {
+                safeReturn = val;
+                safeRsp = ctx->Rsp + (j + 1) * 8;
+                break;
             }
+        }
 
-            if (safeReturn) {
-                ctx->Rip = safeReturn;
-                ctx->Rsp = safeRsp;
-                ctx->Rax = 0;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-
-            // Fallback: just skip the faulting instruction
-            ctx->Rip += kFaceGenDirectInsnLen[i];
+        if (safeReturn) {
+            ctx->Rip = safeReturn;
+            ctx->Rsp = safeRsp;
+            ctx->Rax = 0;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+
+        // Fallback: just skip the faulting instruction and zero the result.
+        ctx->Rip += site.insnLen;
+        ctx->Rax  = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     // Variant A: RIP at garbage address (corrupted vtable jump)
