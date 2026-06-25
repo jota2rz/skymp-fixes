@@ -1,1 +1,8 @@
 build/
+
+# memprofile output -- may contain in-memory secrets (auth tokens, chat
+# messages, player names). NEVER commit these.
+*.heapsnapshot
+memprofile.csv
+memprofile.boot.log
+memprofile-*.log
