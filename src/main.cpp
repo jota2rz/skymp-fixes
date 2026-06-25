@@ -12,6 +12,10 @@
 //    Also covers direct null-deref variants on the job-thread FaceGen
 //    pipeline (e.g. +0429E69, +04328E9) seen when BSFaceGenMorphDataHead
 //    is processed for a partially-loaded actor 3D.
+//    Also covers the DEP / instruction-fetch variant where the corrupted
+//    pointer happens to land inside SkyrimSE.exe at a non-executable
+//    .data/.rdata offset (seen on HairLine face-gen TriShapes, AV says
+//    "Tried to execute memory at ...", ExceptionInformation[0] == 8).
 //
 // 2. WorldClean Crash Fix
 //    Prevents CTD from NPC deletion race condition during load.
@@ -257,17 +261,40 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    // Variant A: RIP at garbage address (corrupted vtable jump)
+    // Variant A: RIP at non-executable address (corrupted vtable / function
+    // pointer call in the FaceGen job pipeline).
+    //
+    // Two sub-flavours we have to recognise:
+    //
+    //   A.1 "garbage RIP" — RIP lands at a completely bogus address outside
+    //       any loaded module (e.g. 0x000003480001). Caught by the heuristic
+    //       gates below.
+    //
+    //   A.2 "non-exec RIP inside SkyrimSE" (added 2026-06-25) — the
+    //       corrupted pointer happens to land at a valid-looking SkyrimSE
+    //       offset that is read-only data (e.g. +0x32580C4 -- two zero bytes
+    //       which disassemble as 'add [rax], al'). The CPU raises an
+    //       instruction-fetch DEP fault; the heuristic gates below would
+    //       otherwise wrongly bail because RIP is inside SkyrimSE.
+    //       Identifiable by ExceptionInformation[0] == 8.
+
+    const bool isExecuteAv = (rec->NumberParameters >= 1) &&
+                             (rec->ExceptionInformation[0] == 8);
 
     uintptr_t faultAddr = ctx->Rip;
 
-    // If RIP is inside a known module, this isn't our crash
-    if (IsInModule(faultAddr))
-        return EXCEPTION_CONTINUE_SEARCH;
+    if (!isExecuteAv) {
+        // Apply the heuristic gates for A.1 only. For A.2 the kernel has
+        // already told us this is a bad-jump fault, so any RIP is fair game.
 
-    // If RIP is in high module address range, not our crash
-    if (faultAddr > 0x7FF000000000ULL)
-        return EXCEPTION_CONTINUE_SEARCH;
+        // If RIP is inside a known module, this isn't our crash
+        if (IsInModule(faultAddr))
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        // If RIP is in high module address range, not our crash
+        if (faultAddr > 0x7FF000000000ULL)
+            return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // Verify this came from face gen by checking the stack
     uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
