@@ -54,6 +54,20 @@
 //    If the file or key is missing, or the value is 0, V8's default is
 //    left untouched.
 //
+// 6. Hang Watchdog (configurable)
+//    Detects when the main game window stops responding (Windows'
+//    IsHungAppWindow) for longer than a configurable threshold and takes
+//    action so the user isn't stuck staring at a frozen game for minutes.
+//    Options: log the hang, save a mini-dump, kill the process, or
+//    dump+kill. Useful for the SkyrimPlatform "hook waiting on a busy JS
+//    thread" freeze pattern, which SkyMPFixes cannot patch externally in
+//    a surgical way (that fix lives in the SkyMP source tree).
+//    Configured via SkyMPFixes.ini:
+//        [HangWatchdog]
+//        Enabled = 1
+//        HangThresholdSec = 30
+//        Action = dump   ; one of: log, dump, kill, dumpAndKill
+//
 // All steps are logged to SkyMPFixes.log next to the DLL so the actual
 // applied value can be verified in-game.
 
@@ -935,6 +949,252 @@ static void InstallV8HeapLimitFix() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FIX 6: Hang Watchdog (configurable via SkyMPFixes.ini)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// When a SkyrimPlatform hook is called on the game's main thread and the JS
+// worker pool is exhausted (or a JS handler is slow), the game locks up
+// forever: the main thread sits in a Sleep loop waiting for a worker that
+// will never come. The proper fix lives in the SkyrimPlatform source
+// (Hook.cpp -- see the upstream 'hook-deadlock-fix' branch). This runtime
+// version can't reach into that code, but it can at least NOTICE the freeze
+// and take action so the user isn't staring at a hung window for minutes.
+//
+// The mechanism is Windows' own IsHungAppWindow(): whenever the main game
+// window has not pumped its message queue for a few seconds Windows returns
+// TRUE. A background thread polls that every 2 seconds. When the game has
+// been unresponsive for [HangWatchdog]HangThresholdSec seconds continuously,
+// we take the configured Action:
+//
+//   log         -- just note it in SkyMPFixes.log
+//   dump        -- write a full-memory mini-dump next to SkyMPFixes.log
+//   kill        -- TerminateProcess on ourselves (immediate exit)
+//   dumpAndKill -- dump first, then kill
+//
+// Defaults are Enabled=1, ThresholdSec=30, Action=dump. That combination is
+// intentionally NON-destructive: it just captures evidence and lets the
+// user decide when to close the game manually. Change Action=dumpAndKill
+// if you want the watchdog to also end the session automatically.
+
+using SP_IsHungAppWindowFn = BOOL (WINAPI*)(HWND);
+
+enum HangAction {
+    kHangAction_Log         = 0,
+    kHangAction_Dump        = 1,
+    kHangAction_Kill        = 2,
+    kHangAction_DumpAndKill = 3,
+};
+
+static bool                 g_hangEnabled      = true;
+static DWORD                g_hangThresholdSec = 30;
+static HangAction           g_hangAction       = kHangAction_Dump;
+static SP_IsHungAppWindowFn g_pIsHungAppWindow = nullptr;
+static HWND                 g_gameWindow       = nullptr;
+
+// EnumWindows callback: pick the first top-level, visible, non-owned window
+// belonging to our own process. That's the game's main render window.
+static BOOL CALLBACK HangWatchdog_FindWindowProc(HWND hwnd, LPARAM /*lp*/) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    g_gameWindow = hwnd;
+    return FALSE; // stop enumeration
+}
+
+// MiniDumpWriteDump prototype (avoid pulling in dbghelp.h)
+using SP_MiniDumpWriteDumpFn = BOOL (WINAPI*)(
+    HANDLE hProcess, DWORD pid, HANDLE hFile, DWORD dumpType,
+    PVOID exceptionParam, PVOID userStreamParam, PVOID callbackParam);
+
+static void HangWatchdog_WriteDump() {
+    if (!g_dllDir[0]) {
+        Log("[watchdog] cannot write dump -- DLL directory not resolved.");
+        return;
+    }
+
+    char dumpPath[MAX_PATH];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::snprintf(dumpPath, MAX_PATH,
+                  "%s\\SkyMPFixes_hang_%04u%02u%02u_%02u%02u%02u.dmp",
+                  g_dllDir,
+                  st.wYear, st.wMonth, st.wDay,
+                  st.wHour, st.wMinute, st.wSecond);
+
+    HANDLE hFile = CreateFileA(dumpPath, GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        Log("[watchdog] failed to create dump file %s (gle=%u)",
+            dumpPath, GetLastError());
+        return;
+    }
+
+    HMODULE dbg = GetModuleHandleA("dbghelp.dll");
+    if (!dbg) dbg = LoadLibraryA("dbghelp.dll");
+    if (!dbg) {
+        Log("[watchdog] failed to load dbghelp.dll (gle=%u)", GetLastError());
+        CloseHandle(hFile);
+        return;
+    }
+
+    auto pWriteDump = reinterpret_cast<SP_MiniDumpWriteDumpFn>(
+        GetProcAddress(dbg, "MiniDumpWriteDump"));
+    if (!pWriteDump) {
+        Log("[watchdog] MiniDumpWriteDump not exported by dbghelp.");
+        CloseHandle(hFile);
+        return;
+    }
+
+    // Flags: MiniDumpWithFullMemory | WithHandleData | WithUnloadedModules
+    //      | WithFullMemoryInfo | WithThreadInfo
+    const DWORD kType = 0x00000002 | 0x00000004 | 0x00000020 | 0x00000800
+                      | 0x00001000;
+    Log("[watchdog] writing dump to %s (this can take a while) ...", dumpPath);
+    BOOL ok = pWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
+                         hFile, kType, nullptr, nullptr, nullptr);
+    CloseHandle(hFile);
+    Log("[watchdog] dump %s (%s)", ok ? "written" : "FAILED", dumpPath);
+}
+
+static const char* HangActionName(HangAction a) {
+    switch (a) {
+        case kHangAction_Log:         return "log";
+        case kHangAction_Dump:        return "dump";
+        case kHangAction_Kill:        return "kill";
+        case kHangAction_DumpAndKill: return "dumpAndKill";
+    }
+    return "?";
+}
+
+static DWORD WINAPI HangWatchdogThread(LPVOID) {
+    // Wait for the game window to appear. It usually shows within seconds,
+    // but a slow SkyPatcher/mod init or an ENB pre-load can delay it, so we
+    // give it up to 5 minutes.
+    for (int i = 0; i < 150 && !g_gameWindow; ++i) {
+        EnumWindows(&HangWatchdog_FindWindowProc, 0);
+        if (!g_gameWindow) Sleep(2000);
+    }
+    if (!g_gameWindow) {
+        Log("[watchdog] could not find the game window after 5 min -- "
+            "watchdog disabled for this session.");
+        return 0;
+    }
+
+    Log("[watchdog] watching HWND=0x%p (thresholdSec=%u, action=%s)",
+        g_gameWindow, g_hangThresholdSec, HangActionName(g_hangAction));
+
+    constexpr DWORD kPollMs = 2000;
+    const DWORD ticksNeeded = (g_hangThresholdSec * 1000u) / kPollMs;
+    if (ticksNeeded == 0) return 0;
+
+    DWORD hungTicks       = 0;
+    bool  triggeredAction = false;
+
+    for (;;) {
+        Sleep(kPollMs);
+
+        // If the window is gone we're done -- game has already exited (or
+        // recreated its window; either way our HWND is stale).
+        if (!IsWindow(g_gameWindow)) {
+            Log("[watchdog] game window closed -- watchdog exiting.");
+            return 0;
+        }
+
+        BOOL hung = g_pIsHungAppWindow(g_gameWindow);
+        if (hung) {
+            ++hungTicks;
+            if (hungTicks == 1) {
+                Log("[watchdog] game window became unresponsive (first "
+                    "detection).");
+            }
+            if (hungTicks >= ticksNeeded && !triggeredAction) {
+                triggeredAction = true;
+                DWORD hungSec = (hungTicks * kPollMs) / 1000;
+                Log("[watchdog] game unresponsive for %us -- action=%s",
+                    hungSec, HangActionName(g_hangAction));
+
+                if (g_hangAction == kHangAction_Dump ||
+                    g_hangAction == kHangAction_DumpAndKill) {
+                    HangWatchdog_WriteDump();
+                }
+                if (g_hangAction == kHangAction_Kill ||
+                    g_hangAction == kHangAction_DumpAndKill) {
+                    Log("[watchdog] terminating process (exit code 0xDEAD).");
+                    TerminateProcess(GetCurrentProcess(), 0xDEADu);
+                    // TerminateProcess doesn't return for the current
+                    // process, but the compiler doesn't know that.
+                    return 0;
+                }
+            }
+        } else {
+            if (hungTicks > 0) {
+                DWORD hungSec = (hungTicks * kPollMs) / 1000;
+                Log("[watchdog] game window recovered after %us hung.",
+                    hungSec);
+            }
+            hungTicks       = 0;
+            triggeredAction = false;
+        }
+    }
+}
+
+static void InstallHangWatchdog() {
+    // Read config
+    g_hangEnabled =
+        (GetPrivateProfileIntA("HangWatchdog", "Enabled", 1, g_iniPath) != 0);
+    int thresholdSec =
+        GetPrivateProfileIntA("HangWatchdog", "HangThresholdSec", 30, g_iniPath);
+
+    char actionStr[32] = {0};
+    GetPrivateProfileStringA("HangWatchdog", "Action", "dump",
+                             actionStr, sizeof(actionStr), g_iniPath);
+    if (_stricmp(actionStr, "log") == 0)              g_hangAction = kHangAction_Log;
+    else if (_stricmp(actionStr, "dump") == 0)         g_hangAction = kHangAction_Dump;
+    else if (_stricmp(actionStr, "kill") == 0)         g_hangAction = kHangAction_Kill;
+    else if (_stricmp(actionStr, "dumpAndKill") == 0)  g_hangAction = kHangAction_DumpAndKill;
+    else                                                g_hangAction = kHangAction_Dump;
+
+    Log("[watchdog] Enabled=%d ThresholdSec=%d Action=%s",
+        (int)g_hangEnabled, thresholdSec, actionStr);
+
+    if (!g_hangEnabled) {
+        Log("[watchdog] disabled by config.");
+        return;
+    }
+
+    // Clamp to sensible bounds (5s..1h)
+    if (thresholdSec < 5)    thresholdSec = 5;
+    if (thresholdSec > 3600) thresholdSec = 3600;
+    g_hangThresholdSec = (DWORD)thresholdSec;
+
+    // Resolve IsHungAppWindow (user32). It's been there since Windows XP,
+    // but we probe defensively anyway.
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (!user32) user32 = LoadLibraryA("user32.dll");
+    if (!user32) {
+        Log("[watchdog] user32.dll not loadable -- watchdog disabled.");
+        return;
+    }
+    g_pIsHungAppWindow = reinterpret_cast<SP_IsHungAppWindowFn>(
+        GetProcAddress(user32, "IsHungAppWindow"));
+    if (!g_pIsHungAppWindow) {
+        Log("[watchdog] user32!IsHungAppWindow not found -- watchdog "
+            "disabled.");
+        return;
+    }
+
+    if (HANDLE t = CreateThread(nullptr, 0, &HangWatchdogThread, nullptr,
+                                0, nullptr)) {
+        CloseHandle(t);
+    } else {
+        Log("[watchdog] CreateThread failed (gle=%u) -- watchdog disabled.",
+            GetLastError());
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // SKSE Entry Points
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -984,6 +1244,7 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     // Install non-crash fixes
     InstallMpClientShutdownFix();
     InstallV8HeapLimitFix();
+    InstallHangWatchdog();
 
     Log("[boot] SKSEPlugin_Load complete.");
     return true;
