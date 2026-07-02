@@ -36,6 +36,14 @@
 //    Crash site: SkyrimSE.exe+0783642
 //    cmp qword ptr [rcx+0x1F8], 0x00 with rcx=0.
 //
+// 8. JobThread memcpy Crash Fix (idle animation variant of fixes 1/7)
+//    Prevents CTD when a BSJobs::JobThread work item dispatches an idle
+//    animation update (e.g. HorseIdleHeadShake) whose animation buffer
+//    has been freed by an actor teardown during fast travel. memcpy is
+//    called with a corrupt size and reads unmapped memory.
+//    Crash site: VCRUNTIME140.dll+0x12251 (AVX2 memcpy)
+//    Caller: SkyrimSE.exe+0x2F782C (idle animation dispatch).
+//
 // 4. MpClientPlugin Shutdown Hang Fix
 //    Prevents the SkyrimSE.exe process from getting stuck forever (game
 //    window gone, only SkyrimPlatform Console visible, ~5-14 GB RAM held)
@@ -553,6 +561,101 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     ctx->EFlags |= 0x40u;  // set ZF
     ctx->Rax     = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 8: JobThread Crash Inside CRT memcpy (Idle Animation Variant)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Third variant of the same actor-delete race as FIX 1 (FaceGen) and FIX 7
+// (MovementController). This time the JobThread work item is dispatching
+// an idle-animation update (TESIdleForm "HorseIdleHeadShake" was observed
+// on the horse whose data got torn down mid-fast-travel), which internally
+// calls memcpy. By the time memcpy runs, the actor's animation buffer has
+// been freed and the size argument has been overwritten with garbage.
+//
+// Crash example:
+//   VCRUNTIME140.dll+0x12251   vmovdqu ymm5, [rdx+r8*1-0x20]  ; AVX2 memcpy
+//   r8 = 0xB8481008 (~3 GB) -- corrupt size argument
+//   caller at SkyrimSE.exe+0x02F782C (idle animation dispatch)
+//   BSJobs::JobThread frames further up the stack (same as fixes 1/7).
+//
+// Match criteria (deliberately narrow to avoid absorbing unrelated CRT
+// crashes):
+//   1. AV that is a READ (ExceptionInformation[0] == 0)
+//   2. RIP is outside SkyrimSE.exe (i.e. in a runtime DLL like VCRUNTIME140)
+//   3. The immediate return address on the stack is in the small window
+//      around SkyrimSE.exe+0x2F7600..+0x2F7900 (idle-anim dispatch fn)
+//   4. A BSJobs::JobThread dispatcher frame is present on the stack
+//
+// Recovery is identical to FIX 7: unwind to the JobThread dispatcher frame
+// so the work item is treated as "done" and the dispatcher moves on. No
+// fallback path here -- if we can't find a dispatcher frame we return
+// EXCEPTION_CONTINUE_SEARCH and let the game crash normally, because
+// resuming inside a partially-executed memcpy is unsafe.
+
+static constexpr uintptr_t kFix8CallerRangeStart = 0x02F7600;
+static constexpr uintptr_t kFix8CallerRangeEnd   = 0x02F7900;
+
+static LONG CALLBACK JobMemcpyExceptionHandler(EXCEPTION_POINTERS* a_ex) {
+    const auto* rec = a_ex->ExceptionRecord;
+    auto*       ctx = a_ex->ContextRecord;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // ExceptionInformation[0]: 0 = read, 1 = write, 8 = DEP.
+    // We only handle reads -- resuming after a partial write in memcpy
+    // would leave the destination corrupted.
+    if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Only when the fault is inside a runtime DLL, NOT inside SkyrimSE
+    // (fixes 1 and 7 handle the in-SkyrimSE crash sites already).
+    if (ctx->Rip >= g_baseAddr && ctx->Rip < g_moduleEnd)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Check that the immediate caller is the idle-animation dispatch site.
+    // This keeps us from accidentally swallowing unrelated CRT crashes.
+    uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+    uintptr_t ra = 0;
+    __try {
+        ra = stack[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (ra < g_baseAddr + kFix8CallerRangeStart ||
+        ra >= g_baseAddr + kFix8CallerRangeEnd)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Same recovery as FIX 7: unwind to the JobThread dispatcher frame.
+    uintptr_t safeReturn = 0;
+    uintptr_t safeRsp = 0;
+
+    for (int j = 0; j < 384; ++j) {
+        uintptr_t val = 0;
+        __try {
+            val = stack[j];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        if (IsInJobThreadDispatcher(val, g_baseAddr, g_moduleEnd)) {
+            safeReturn = val;
+            safeRsp = ctx->Rsp + (j + 1) * 8;
+            break;
+        }
+    }
+
+    if (safeReturn) {
+        ctx->Rip = safeReturn;
+        ctx->Rsp = safeRsp;
+        ctx->Rax = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Couldn't find a safe frame to return to -- let the crash proceed
+    // so CrashLoggerSSE captures it and we get more info.
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1458,8 +1561,9 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     AddVectoredExceptionHandler(1, WorldCleanExceptionHandler);
     AddVectoredExceptionHandler(1, TextureQueueExceptionHandler);
     AddVectoredExceptionHandler(1, MovementJobExceptionHandler);
+    AddVectoredExceptionHandler(1, JobMemcpyExceptionHandler);
     Log("[boot] Crash-fix exception handlers installed (FaceGen, WorldClean, "
-        "TextureQueue, MovementJob).");
+        "TextureQueue, MovementJob, JobMemcpy).");
 
     // Install non-crash fixes
     InstallMpClientShutdownFix();
