@@ -35,6 +35,21 @@
                                     //   is NOT started with --expose-gc, so
                                     //   this won't do anything by default.
 
+  // --- Frame-time / hitch detection ---
+  //
+  // SkyrimPlatform dispatches the "update" event once per game frame while
+  // the window is focused. Measuring the wall-clock gap between consecutive
+  // "update" calls gives us an approximate frame time as observed by JS.
+  // A large gap corresponds to a visible stutter or a stalled render.
+  //
+  // The CSV sample records min/max/avg/count over the last PROFILE_INTERVAL_SEC
+  // window, plus a count of frames >= HITCH_THRESHOLD_MS.
+  //
+  // Each individual hitch (gap >= HITCH_THRESHOLD_MS) is also written to a
+  // dedicated log so you can correlate specific in-game events with stalls.
+  var HITCH_THRESHOLD_MS = 100;     // frames slower than this count as a hitch
+  var HITCH_LOG_MIN_MS   = 100;     // don't spam the hitch log below this
+
   // --- Auto heap-snapshot triggers ---
   //
   // A V8 heap snapshot is a JSON file (~5-10x current heap size) that lists
@@ -65,6 +80,7 @@
   // SkyrimPlatform's other diag files (Data\Platform\sp_*.log).
   var CSV_PATH       = 'memprofile.csv';
   var BOOT_PATH      = 'memprofile.boot.log';
+  var HITCH_PATH     = 'memprofile.hitches.log';
   var HEARTBEAT_PATH = 'SkyMPFixes.heartbeat';
   try {
     var cwd = (typeof process !== 'undefined' && typeof process.cwd === 'function')
@@ -72,6 +88,7 @@
     if (path) {
       CSV_PATH       = path.join(cwd, 'Data', 'Platform', 'memprofile.csv');
       BOOT_PATH      = path.join(cwd, 'Data', 'Platform', 'memprofile.boot.log');
+      HITCH_PATH     = path.join(cwd, 'Data', 'Platform', 'memprofile.hitches.log');
       // The heartbeat file is picked up by SkyMPFixes.dll's watchdog.
       // Path is fixed relative to the Skyrim install dir so both sides
       // agree on it without needing to share config.
@@ -79,6 +96,7 @@
     } else {
       CSV_PATH       = cwd + '\\Data\\Platform\\memprofile.csv';
       BOOT_PATH      = cwd + '\\Data\\Platform\\memprofile.boot.log';
+      HITCH_PATH     = cwd + '\\Data\\Platform\\memprofile.hitches.log';
       HEARTBEAT_PATH = cwd + '\\Data\\Platform\\SkyMPFixes.heartbeat';
     }
   } catch (e) { /* keep defaults */ }
@@ -138,19 +156,40 @@
   spPrint('[memprofile] loaded. Sampling every ' + PROFILE_INTERVAL_SEC +
           's -> ' + CSV_PATH);
 
-  // ----- CSV header (only if file is missing or empty) -------------------
+  // ----- CSV header (rotate old file if the schema changed) -------------
+  var CSV_HEADER =
+    'timestamp_iso,uptime_s,rss_mb,heap_used_mb,heap_total_mb,' +
+    'heap_limit_mb,external_mb,arraybuffers_mb,storage_keys,' +
+    'worldmodel_forms,' +
+    'frame_count,frame_min_ms,frame_avg_ms,frame_max_ms,hitches_ge_' +
+    HITCH_THRESHOLD_MS + 'ms\n';
   try {
     var needHeader = true;
     try {
       var st = fs.statSync(CSV_PATH);
-      if (st && st.size > 0) needHeader = false;
+      if (st && st.size > 0) {
+        // Read first line and compare against our current header. If the
+        // schema changed (e.g. added frame-time columns after an update),
+        // rotate the old file aside so plotting tools don't choke on mixed
+        // row widths.
+        var existing = fs.readFileSync(CSV_PATH, 'utf8');
+        var firstLine = existing.split('\n')[0] + '\n';
+        if (firstLine === CSV_HEADER) {
+          needHeader = false;
+        } else {
+          var rotated = CSV_PATH.replace(/\.csv$/i, '') + '.' +
+                        new Date().toISOString().replace(/[:.]/g, '-') +
+                        '.pre-schema-change.csv';
+          try {
+            fs.renameSync(CSV_PATH, rotated);
+            writeBootLine('CSV schema changed -- rotated old file to ' + rotated);
+          } catch (_) { /* leave old file in place; we'll overwrite below */ }
+        }
+      }
     } catch (_) { /* ENOENT -> need header */ }
 
     if (needHeader) {
-      fs.writeFileSync(CSV_PATH,
-        'timestamp_iso,uptime_s,rss_mb,heap_used_mb,heap_total_mb,' +
-        'heap_limit_mb,external_mb,arraybuffers_mb,storage_keys,' +
-        'worldmodel_forms\n', { encoding: 'utf8' });
+      fs.writeFileSync(CSV_PATH, CSV_HEADER, { encoding: 'utf8' });
     }
   } catch (e) {
     writeBootLine('CSV open failed: ' + (e && e.message));
@@ -162,6 +201,50 @@
   var startedAt = Date.now();
   function toMB(bytes)  { return Math.round((bytes || 0) / 1024 / 1024 * 10) / 10; }
   function safeNum(n)   { return (typeof n === 'number' && isFinite(n)) ? n : 0; }
+
+  // ----- Frame-time accumulators ----------------------------------------
+  // Reset after every CSV sample. `frameLastAt=0` means "no previous frame
+  // yet"; the first update after boot / after a sample won't produce a gap.
+  var frameLastAt   = 0;
+  var frameCount    = 0;
+  var frameSumMs    = 0;
+  var frameMinMs    = 0;
+  var frameMaxMs    = 0;
+  var frameHitches  = 0;
+  // Guard: if the window is minimized or the game is paused for a long
+  // time, SP stops firing "update" and the next tick's gap is huge. That's
+  // not a hitch we care about, so cap what we count as a "real" frame gap.
+  var FRAME_GAP_CAP_MS = 5000;
+
+  function recordFrameGap(gapMs) {
+    if (gapMs <= 0 || gapMs > FRAME_GAP_CAP_MS) return;
+    frameCount++;
+    frameSumMs += gapMs;
+    if (frameMinMs === 0 || gapMs < frameMinMs) frameMinMs = gapMs;
+    if (gapMs > frameMaxMs) frameMaxMs = gapMs;
+    if (gapMs >= HITCH_THRESHOLD_MS) frameHitches++;
+  }
+
+  function resetFrameAccum() {
+    frameCount = 0; frameSumMs = 0; frameMinMs = 0; frameMaxMs = 0;
+    frameHitches = 0;
+  }
+
+  function logHitch(now, gapMs) {
+    if (!fs) return;
+    if (gapMs < HITCH_LOG_MIN_MS) return;
+    try {
+      var mem = (typeof process !== 'undefined' && process.memoryUsage)
+        ? process.memoryUsage() : {};
+      var ts  = new Date(now).toISOString();
+      var upS = Math.round((now - startedAt) / 1000);
+      fs.appendFileSync(HITCH_PATH,
+        ts + ' uptime=' + upS + 's gap_ms=' + Math.round(gapMs) +
+        ' rss_mb=' + toMB(mem.rss) +
+        ' heap_used_mb=' + toMB(mem.heapUsed) + '\n',
+        { encoding: 'utf8' });
+    } catch (_) {}
+  }
 
   function getStorageKeyCount() {
     try {
@@ -201,6 +284,9 @@
 
       var heapUsedMB = toMB(hs.used_heap_size  || mem.heapUsed);
 
+      var frameAvgMs = frameCount > 0
+        ? Math.round((frameSumMs / frameCount) * 10) / 10 : 0;
+
       var line =
         ts + ',' +
         upS + ',' +
@@ -211,9 +297,18 @@
         toMB(mem.external) + ',' +
         toMB(mem.arrayBuffers) + ',' +
         safeNum(getStorageKeyCount()) + ',' +
-        safeNum(getWorldModelFormCount()) + '\n';
+        safeNum(getWorldModelFormCount()) + ',' +
+        frameCount + ',' +
+        (Math.round(frameMinMs * 10) / 10) + ',' +
+        frameAvgMs + ',' +
+        (Math.round(frameMaxMs * 10) / 10) + ',' +
+        frameHitches + '\n';
 
       fs.appendFileSync(CSV_PATH, line, { encoding: 'utf8' });
+
+      // Reset frame accumulators after each sample so the next row reflects
+      // the next PROFILE_INTERVAL_SEC window only.
+      resetFrameAccum();
 
       // Check snapshot triggers AFTER writing the CSV row so the snapshot is
       // ordered correctly in the timeline.
@@ -310,6 +405,14 @@
   try {
     sp.on('update', function () {
       var now = Date.now();
+      // Frame-gap measurement: distance from previous "update" fires.
+      if (frameLastAt !== 0) {
+        var gap = now - frameLastAt;
+        recordFrameGap(gap);
+        if (gap >= HITCH_THRESHOLD_MS) logHitch(now, gap);
+      }
+      frameLastAt = now;
+
       touchHeartbeat(now);
       if (now - lastSampleAt >= PROFILE_INTERVAL_SEC * 1000) {
         lastSampleAt = now;
@@ -323,6 +426,8 @@
     });
     writeBootLine('on("update") handler registered');
     writeBootLine('heartbeat path: ' + HEARTBEAT_PATH);
+    writeBootLine('hitches path:   ' + HITCH_PATH +
+                  ' (threshold=' + HITCH_THRESHOLD_MS + 'ms)');
   } catch (e) {
     writeBootLine('on("update") failed: ' + (e && e.message));
     spPrint('[memprofile] on("update") failed: ' + (e && e.message));
