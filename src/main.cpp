@@ -28,6 +28,14 @@
 //    Crash site: SkyrimSE.exe+0E02786
 //    mov rax, [rcx+0x28] with rcx=0.
 //
+// 7. MovementController Job Crash Fix (same root cause as FaceGen)
+//    Prevents CTD when a BSJobs::JobThread work item dispatches a
+//    movement-controller message (IMovementMessageInterface) against an
+//    actor that SkyMP has already despawned (kDeleted, FormID=0). Same
+//    root cause as fix 1, different subsystem.
+//    Crash site: SkyrimSE.exe+0783642
+//    cmp qword ptr [rcx+0x1F8], 0x00 with rcx=0.
+//
 // 4. MpClientPlugin Shutdown Hang Fix
 //    Prevents the SkyrimSE.exe process from getting stuck forever (game
 //    window gone, only SkyrimPlatform Console visible, ~5-14 GB RAM held)
@@ -459,6 +467,92 @@ static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 7: MovementController Job Crash (same class as FaceGen, different site)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Crash at SkyrimSE.exe+0x0783642:
+//   cmp qword ptr [rcx+0x1F8], 0x00        (8 bytes: 48 83 B9 F8 01 00 00 00)
+// with RCX=0.
+//
+// Objects in scope at crash time:
+//   R15 = Character* "Rabbit" with Flags: kDeleted, FormID = 0x00000000
+//         (i.e. an actor that MpClientPlugin has already despawned)
+//   RBX = MovementControllerNPC*
+//   R8  = "IMovementMessageInterface" (the interface being asked for)
+//   Stack contains the same BSJobs::JobThread pipeline frames as the FaceGen
+//   crashes: +0CF7888, +0CF7E51, +0CF61DA, +0CD0DBD.
+//
+// Same root cause as FIX 1 (FaceGen): SkyMP's aggressive spawn/delete race
+// leaves an actor kDeleted / FormID=0 while a BSJobs::JobThread work item
+// (this time a movement-controller message dispatch) still references it.
+// The dispatch reaches a null vtable / message interface and dereferences
+// RCX=0 in the compare above.
+//
+// Recovery is identical in spirit to FIX 1 Variant B: find a stack frame
+// belonging to the JobThread dispatcher (SkyrimSE.exe+0xCF6000..+0xCF8000)
+// and unwind to it, so the job simply appears to have "done nothing" and
+// the dispatcher moves on to the next item. If no dispatcher frame is
+// found within a reasonable scan depth, fall back to skipping the compare
+// and forcing ZF=1 so the immediate caller takes the "null field" path.
+
+static constexpr uintptr_t kMovementJobCrashOffset = 0x0783642;
+static constexpr uint32_t  kMovementJobCrashInsnLen = 8;
+
+// The BSJobs::JobThread work-item dispatcher lives in this range. Frames
+// here are the ones we want to unwind to: the dispatcher treats a returning
+// job as "done, next" and never touches the fields we just skipped.
+static bool IsInJobThreadDispatcher(uintptr_t addr, uintptr_t baseAddr,
+                                    uintptr_t moduleEnd) {
+    if (addr < baseAddr || addr >= moduleEnd)
+        return false;
+    uintptr_t off = addr - baseAddr;
+    return off >= 0x00CF6000 && off <= 0x00CF8000;
+}
+
+static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
+    const auto* rec = a_ex->ExceptionRecord;
+    auto*       ctx = a_ex->ContextRecord;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ctx->Rip != g_baseAddr + kMovementJobCrashOffset)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ctx->Rcx != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Scan the stack for a JobThread dispatcher return address. Depth 384
+    // slots = 3 KB, which covers the ~1.5 KB gap we saw in the crash dump
+    // between the leaf frame and the dispatcher.
+    uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+    uintptr_t safeReturn = 0;
+    uintptr_t safeRsp = 0;
+
+    for (int j = 0; j < 384; ++j) {
+        uintptr_t val = stack[j];
+        if (IsInJobThreadDispatcher(val, g_baseAddr, g_moduleEnd)) {
+            safeReturn = val;
+            safeRsp = ctx->Rsp + (j + 1) * 8;
+            break;
+        }
+    }
+
+    if (safeReturn) {
+        ctx->Rip = safeReturn;
+        ctx->Rsp = safeRsp;
+        ctx->Rax = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Fallback: skip the compare and pretend [rcx+0x1F8] was 0.
+    // The compare instruction is `cmp qword ptr [rcx+0x1F8], 0`; if we set
+    // ZF=1 the caller sees "field is null" and typically returns cleanly.
+    ctx->Rip    += kMovementJobCrashInsnLen;
+    ctx->EFlags |= 0x40u;  // set ZF
+    ctx->Rax     = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1363,8 +1457,9 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     AddVectoredExceptionHandler(1, FaceGenExceptionHandler);
     AddVectoredExceptionHandler(1, WorldCleanExceptionHandler);
     AddVectoredExceptionHandler(1, TextureQueueExceptionHandler);
+    AddVectoredExceptionHandler(1, MovementJobExceptionHandler);
     Log("[boot] Crash-fix exception handlers installed (FaceGen, WorldClean, "
-        "TextureQueue).");
+        "TextureQueue, MovementJob).");
 
     // Install non-crash fixes
     InstallMpClientShutdownFix();
