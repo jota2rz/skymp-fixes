@@ -88,7 +88,7 @@
 //        Enabled = 1
 //        HangThresholdSec  = 30   ; window pump stuck for this long
 //        HeartbeatStaleSec = 10   ; game-loop heartbeat stale for this long
-//        Action = dump   ; one of: log, dump, kill, dumpAndKill
+//        Action = dumpAndKill   ; one of: log, dump, kill, dumpAndKill
 //
 // All steps are logged to SkyMPFixes.log next to the DLL so the actual
 // applied value can be verified in-game.
@@ -1174,10 +1174,10 @@ static void InstallV8HeapLimitFix() {
 //   kill        -- TerminateProcess on ourselves (immediate exit)
 //   dumpAndKill -- dump first, then kill
 //
-// Defaults are Enabled=1, ThresholdSec=30, Action=dump. That combination is
-// intentionally NON-destructive: it just captures evidence and lets the
-// user decide when to close the game manually. Change Action=dumpAndKill
-// if you want the watchdog to also end the session automatically.
+// Defaults are Enabled=1, ThresholdSec=30, Action=dumpAndKill. That
+// combination captures a mini-dump for later analysis and then ends the
+// frozen session so the user can restart the game. Change Action=dump if
+// you'd rather keep the hung process running and decide when to close it.
 
 using SP_IsHungAppWindowFn = BOOL (WINAPI*)(HWND);
 
@@ -1190,7 +1190,7 @@ enum HangAction {
 
 static bool                 g_hangEnabled        = true;
 static DWORD                g_hangThresholdSec   = 30;
-static HangAction           g_hangAction         = kHangAction_Dump;
+static HangAction           g_hangAction         = kHangAction_DumpAndKill;
 static SP_IsHungAppWindowFn g_pIsHungAppWindow   = nullptr;
 static HWND                 g_gameWindow         = nullptr;
 
@@ -1434,13 +1434,13 @@ static void InstallHangWatchdog() {
         GetPrivateProfileIntA("HangWatchdog", "HeartbeatStaleSec", 10, g_iniPath);
 
     char actionStr[32] = {0};
-    GetPrivateProfileStringA("HangWatchdog", "Action", "dump",
+    GetPrivateProfileStringA("HangWatchdog", "Action", "dumpAndKill",
                              actionStr, sizeof(actionStr), g_iniPath);
     if (_stricmp(actionStr, "log") == 0)              g_hangAction = kHangAction_Log;
     else if (_stricmp(actionStr, "dump") == 0)         g_hangAction = kHangAction_Dump;
     else if (_stricmp(actionStr, "kill") == 0)         g_hangAction = kHangAction_Kill;
     else if (_stricmp(actionStr, "dumpAndKill") == 0)  g_hangAction = kHangAction_DumpAndKill;
-    else                                                g_hangAction = kHangAction_Dump;
+    else                                                g_hangAction = kHangAction_DumpAndKill;
 
     Log("[watchdog] Enabled=%d ThresholdSec=%d HeartbeatStaleSec=%d Action=%s",
         (int)g_hangEnabled, thresholdSec, heartbeatSec, actionStr);
