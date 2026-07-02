@@ -1203,12 +1203,19 @@ static HWND                 g_gameWindow         = nullptr;
 //
 // If the file NEVER exists (memprofile.js not installed) the check silently
 // skips -- no false positives from users who don't run the profiler.
+//
+// Freshness rule: we only "count" a heartbeat as seen when its mtime is
+// newer than the watchdog's own start time. That way a stale file left
+// over from a previous session (e.g. a game that crashed) cannot trigger
+// an immediate false positive on the next launch.
 static DWORD                g_heartbeatStaleSec  = 10;      // 0 disables
 static char                 g_heartbeatPath[MAX_PATH] = {0};
 static bool                 g_heartbeatSeen      = false;   // true once we've
-                                                            // seen the file
-                                                            // exist at least
-                                                            // once
+                                                            // seen a fresh
+                                                            // (post-startup)
+                                                            // heartbeat
+static ULONGLONG            g_watchdogStartFt    = 0;       // FILETIME ticks
+                                                            // at watchdog init
 
 // EnumWindows callback: pick the first top-level, visible, non-owned window
 // belonging to our own process. That's the game's main render window.
@@ -1304,27 +1311,36 @@ static void HangWatchdog_TakeAction(const char* reason) {
 }
 
 // Returns the age of the heartbeat file in seconds, or -1 if the file
-// doesn't exist / can't be stat'd. On first successful read we latch
-// g_heartbeatSeen so a later disappearance of the file (e.g. plugin
-// crashed) still counts as staleness rather than "not installed".
+// doesn't exist / can't be stat'd / is only a stale leftover from a
+// previous session. On first successful read of a FRESH heartbeat we
+// latch g_heartbeatSeen so a later disappearance of the file (e.g.
+// plugin crashed) still counts as staleness rather than "not installed".
 static long long HangWatchdog_HeartbeatAgeSec() {
     if (!g_heartbeatPath[0]) return -1;
 
     WIN32_FILE_ATTRIBUTE_DATA attr;
     if (!GetFileAttributesExA(g_heartbeatPath, GetFileExInfoStandard, &attr)) {
-        // File missing. If we've never seen it, skip silently -- most
-        // likely memprofile.js is not installed. If we HAVE seen it,
+        // File missing. If we've never seen a fresh one, skip silently --
+        // most likely memprofile.js is not installed. If we HAVE seen it,
         // treat as very stale (something removed it while running).
         return g_heartbeatSeen ? (long long)0x7FFFFFFF : -1;
+    }
+
+    ULARGE_INTEGER ftMtime;
+    ftMtime.LowPart  = attr.ftLastWriteTime.dwLowDateTime;
+    ftMtime.HighPart = attr.ftLastWriteTime.dwHighDateTime;
+
+    // If the file's mtime is older than the watchdog's start time, it's a
+    // leftover from a previous session. Ignore it until memprofile.js
+    // touches it and pushes the mtime forward.
+    if (g_watchdogStartFt && ftMtime.QuadPart < g_watchdogStartFt) {
+        return -1;
     }
 
     g_heartbeatSeen = true;
 
     // Compare file's last-write-time against system time.
-    ULARGE_INTEGER ftMtime, ftNow;
-    ftMtime.LowPart  = attr.ftLastWriteTime.dwLowDateTime;
-    ftMtime.HighPart = attr.ftLastWriteTime.dwHighDateTime;
-
+    ULARGE_INTEGER ftNow;
     FILETIME nowFt;
     GetSystemTimeAsFileTime(&nowFt);
     ftNow.LowPart  = nowFt.dwLowDateTime;
@@ -1336,6 +1352,17 @@ static long long HangWatchdog_HeartbeatAgeSec() {
 }
 
 static DWORD WINAPI HangWatchdogThread(LPVOID) {
+    // Record our start time so HangWatchdog_HeartbeatAgeSec() can ignore
+    // heartbeat files left over from previous sessions.
+    {
+        FILETIME ftNow;
+        GetSystemTimeAsFileTime(&ftNow);
+        ULARGE_INTEGER u;
+        u.LowPart  = ftNow.dwLowDateTime;
+        u.HighPart = ftNow.dwHighDateTime;
+        g_watchdogStartFt = u.QuadPart;
+    }
+
     // Wait for the game window to appear. It usually shows within seconds,
     // but a slow SkyPatcher/mod init or an ENB pre-load can delay it, so we
     // give it up to 5 minutes.
