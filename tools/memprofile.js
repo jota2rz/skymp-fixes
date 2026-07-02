@@ -63,17 +63,23 @@
   // ----- Resolve output paths --------------------------------------------
   // process.cwd() is the Skyrim install dir at runtime. Put the CSV next to
   // SkyrimPlatform's other diag files (Data\Platform\sp_*.log).
-  var CSV_PATH  = 'memprofile.csv';
-  var BOOT_PATH = 'memprofile.boot.log';
+  var CSV_PATH       = 'memprofile.csv';
+  var BOOT_PATH      = 'memprofile.boot.log';
+  var HEARTBEAT_PATH = 'SkyMPFixes.heartbeat';
   try {
     var cwd = (typeof process !== 'undefined' && typeof process.cwd === 'function')
       ? process.cwd() : '.';
     if (path) {
-      CSV_PATH  = path.join(cwd, 'Data', 'Platform', 'memprofile.csv');
-      BOOT_PATH = path.join(cwd, 'Data', 'Platform', 'memprofile.boot.log');
+      CSV_PATH       = path.join(cwd, 'Data', 'Platform', 'memprofile.csv');
+      BOOT_PATH      = path.join(cwd, 'Data', 'Platform', 'memprofile.boot.log');
+      // The heartbeat file is picked up by SkyMPFixes.dll's watchdog.
+      // Path is fixed relative to the Skyrim install dir so both sides
+      // agree on it without needing to share config.
+      HEARTBEAT_PATH = path.join(cwd, 'Data', 'Platform', 'SkyMPFixes.heartbeat');
     } else {
-      CSV_PATH  = cwd + '\\Data\\Platform\\memprofile.csv';
-      BOOT_PATH = cwd + '\\Data\\Platform\\memprofile.boot.log';
+      CSV_PATH       = cwd + '\\Data\\Platform\\memprofile.csv';
+      BOOT_PATH      = cwd + '\\Data\\Platform\\memprofile.boot.log';
+      HEARTBEAT_PATH = cwd + '\\Data\\Platform\\SkyMPFixes.heartbeat';
     }
   } catch (e) { /* keep defaults */ }
 
@@ -280,12 +286,31 @@
   // ----- Periodic sampling ------------------------------------------------
   // We drive sampling off SkyrimPlatform's "update" event (fires while the
   // game window is active, both in-game and on the main menu).
-  var lastSampleAt = Date.now();
-  var lastGcAt    = Date.now();
+  var lastSampleAt    = Date.now();
+  var lastGcAt        = Date.now();
+  var lastHeartbeatAt = 0; // 0 so we touch immediately on first tick
+
+  // Touch (create-or-truncate to 0 bytes) the heartbeat file so its mtime
+  // reflects the last SP "update" tick. SkyMPFixes.dll's watchdog reads
+  // this to distinguish "window responsive but game loop stuck" freezes
+  // from real hangs.
+  function touchHeartbeat(now) {
+    if (!fs) return;
+    // Throttle to at most once per second so we don't spam the disk.
+    if (now - lastHeartbeatAt < 1000) return;
+    lastHeartbeatAt = now;
+    try {
+      // writeFileSync with empty string truncates and updates mtime.
+      fs.writeFileSync(HEARTBEAT_PATH, '', { encoding: 'utf8' });
+    } catch (_) {
+      // Best-effort: if the disk is full or the path is bad, silently skip.
+    }
+  }
 
   try {
     sp.on('update', function () {
       var now = Date.now();
+      touchHeartbeat(now);
       if (now - lastSampleAt >= PROFILE_INTERVAL_SEC * 1000) {
         lastSampleAt = now;
         sample();
@@ -297,6 +322,7 @@
       }
     });
     writeBootLine('on("update") handler registered');
+    writeBootLine('heartbeat path: ' + HEARTBEAT_PATH);
   } catch (e) {
     writeBootLine('on("update") failed: ' + (e && e.message));
     spPrint('[memprofile] on("update") failed: ' + (e && e.message));

@@ -62,10 +62,16 @@
 //    dump+kill. Useful for the SkyrimPlatform "hook waiting on a busy JS
 //    thread" freeze pattern, which SkyMPFixes cannot patch externally in
 //    a surgical way (that fix lives in the SkyMP source tree).
+//    Also includes a second detector based on a "game-loop heartbeat"
+//    file that memprofile.js touches every SP update tick -- catches
+//    freezes where the window still pumps messages but the game logic
+//    is stuck (the typical SkyrimPlatform hook deadlock, which never
+//    trips IsHungAppWindow).
 //    Configured via SkyMPFixes.ini:
 //        [HangWatchdog]
 //        Enabled = 1
-//        HangThresholdSec = 30
+//        HangThresholdSec  = 30   ; window pump stuck for this long
+//        HeartbeatStaleSec = 10   ; game-loop heartbeat stale for this long
 //        Action = dump   ; one of: log, dump, kill, dumpAndKill
 //
 // All steps are logged to SkyMPFixes.log next to the DLL so the actual
@@ -985,11 +991,27 @@ enum HangAction {
     kHangAction_DumpAndKill = 3,
 };
 
-static bool                 g_hangEnabled      = true;
-static DWORD                g_hangThresholdSec = 30;
-static HangAction           g_hangAction       = kHangAction_Dump;
-static SP_IsHungAppWindowFn g_pIsHungAppWindow = nullptr;
-static HWND                 g_gameWindow       = nullptr;
+static bool                 g_hangEnabled        = true;
+static DWORD                g_hangThresholdSec   = 30;
+static HangAction           g_hangAction         = kHangAction_Dump;
+static SP_IsHungAppWindowFn g_pIsHungAppWindow   = nullptr;
+static HWND                 g_gameWindow         = nullptr;
+
+// ----- Game-loop heartbeat check (complements IsHungAppWindow) -----------
+// memprofile.js touches this file on every SP "update" tick (throttled to
+// ~1 Hz). If it goes stale for more than g_heartbeatStaleSec seconds while
+// the file exists, we treat it as a game-loop hang -- catches freezes where
+// the window pump keeps running (so IsHungAppWindow reports OK) but the
+// game's update loop is stuck (typical SkyrimPlatform hook deadlock).
+//
+// If the file NEVER exists (memprofile.js not installed) the check silently
+// skips -- no false positives from users who don't run the profiler.
+static DWORD                g_heartbeatStaleSec  = 10;      // 0 disables
+static char                 g_heartbeatPath[MAX_PATH] = {0};
+static bool                 g_heartbeatSeen      = false;   // true once we've
+                                                            // seen the file
+                                                            // exist at least
+                                                            // once
 
 // EnumWindows callback: pick the first top-level, visible, non-owned window
 // belonging to our own process. That's the game's main render window.
@@ -1068,6 +1090,54 @@ static const char* HangActionName(HangAction a) {
     return "?";
 }
 
+// Take the configured action for a detected hang. Shared by both the window
+// hang path and the heartbeat-stale path.
+static void HangWatchdog_TakeAction(const char* reason) {
+    Log("[watchdog] taking action=%s -- reason: %s",
+        HangActionName(g_hangAction), reason);
+    if (g_hangAction == kHangAction_Dump ||
+        g_hangAction == kHangAction_DumpAndKill) {
+        HangWatchdog_WriteDump();
+    }
+    if (g_hangAction == kHangAction_Kill ||
+        g_hangAction == kHangAction_DumpAndKill) {
+        Log("[watchdog] terminating process (exit code 0xDEAD).");
+        TerminateProcess(GetCurrentProcess(), 0xDEADu);
+    }
+}
+
+// Returns the age of the heartbeat file in seconds, or -1 if the file
+// doesn't exist / can't be stat'd. On first successful read we latch
+// g_heartbeatSeen so a later disappearance of the file (e.g. plugin
+// crashed) still counts as staleness rather than "not installed".
+static long long HangWatchdog_HeartbeatAgeSec() {
+    if (!g_heartbeatPath[0]) return -1;
+
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (!GetFileAttributesExA(g_heartbeatPath, GetFileExInfoStandard, &attr)) {
+        // File missing. If we've never seen it, skip silently -- most
+        // likely memprofile.js is not installed. If we HAVE seen it,
+        // treat as very stale (something removed it while running).
+        return g_heartbeatSeen ? (long long)0x7FFFFFFF : -1;
+    }
+
+    g_heartbeatSeen = true;
+
+    // Compare file's last-write-time against system time.
+    ULARGE_INTEGER ftMtime, ftNow;
+    ftMtime.LowPart  = attr.ftLastWriteTime.dwLowDateTime;
+    ftMtime.HighPart = attr.ftLastWriteTime.dwHighDateTime;
+
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    ftNow.LowPart  = nowFt.dwLowDateTime;
+    ftNow.HighPart = nowFt.dwHighDateTime;
+
+    if (ftNow.QuadPart <= ftMtime.QuadPart) return 0;
+    // FILETIME is 100-ns ticks; divide by 10,000,000 for seconds.
+    return (long long)((ftNow.QuadPart - ftMtime.QuadPart) / 10000000ULL);
+}
+
 static DWORD WINAPI HangWatchdogThread(LPVOID) {
     // Wait for the game window to appear. It usually shows within seconds,
     // but a slow SkyPatcher/mod init or an ENB pre-load can delay it, so we
@@ -1082,15 +1152,20 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
         return 0;
     }
 
-    Log("[watchdog] watching HWND=0x%p (thresholdSec=%u, action=%s)",
-        g_gameWindow, g_hangThresholdSec, HangActionName(g_hangAction));
+    Log("[watchdog] watching HWND=0x%p (windowHangSec=%u, heartbeatStaleSec=%u,"
+        " action=%s)",
+        g_gameWindow, g_hangThresholdSec, g_heartbeatStaleSec,
+        HangActionName(g_hangAction));
+    if (g_heartbeatPath[0])
+        Log("[watchdog] heartbeat file: %s", g_heartbeatPath);
 
     constexpr DWORD kPollMs = 2000;
     const DWORD ticksNeeded = (g_hangThresholdSec * 1000u) / kPollMs;
     if (ticksNeeded == 0) return 0;
 
-    DWORD hungTicks       = 0;
-    bool  triggeredAction = false;
+    DWORD hungTicks               = 0;
+    bool  triggeredAction         = false;
+    bool  triggeredHeartbeatAction = false;
 
     for (;;) {
         Sleep(kPollMs);
@@ -1102,6 +1177,7 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
             return 0;
         }
 
+        // --- Detector A: window message pump stuck ---
         BOOL hung = g_pIsHungAppWindow(g_gameWindow);
         if (hung) {
             ++hungTicks;
@@ -1112,21 +1188,10 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
             if (hungTicks >= ticksNeeded && !triggeredAction) {
                 triggeredAction = true;
                 DWORD hungSec = (hungTicks * kPollMs) / 1000;
-                Log("[watchdog] game unresponsive for %us -- action=%s",
-                    hungSec, HangActionName(g_hangAction));
-
-                if (g_hangAction == kHangAction_Dump ||
-                    g_hangAction == kHangAction_DumpAndKill) {
-                    HangWatchdog_WriteDump();
-                }
-                if (g_hangAction == kHangAction_Kill ||
-                    g_hangAction == kHangAction_DumpAndKill) {
-                    Log("[watchdog] terminating process (exit code 0xDEAD).");
-                    TerminateProcess(GetCurrentProcess(), 0xDEADu);
-                    // TerminateProcess doesn't return for the current
-                    // process, but the compiler doesn't know that.
-                    return 0;
-                }
+                char reason[128];
+                std::snprintf(reason, sizeof(reason),
+                              "window unresponsive for %us", hungSec);
+                HangWatchdog_TakeAction(reason);
             }
         } else {
             if (hungTicks > 0) {
@@ -1137,6 +1202,28 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
             hungTicks       = 0;
             triggeredAction = false;
         }
+
+        // --- Detector B: game-loop heartbeat stale ---
+        // Runs INDEPENDENTLY of detector A so a hang that keeps the message
+        // pump alive but stalls the game loop (typical SkyrimPlatform hook
+        // deadlock) still gets caught.
+        if (g_heartbeatStaleSec > 0) {
+            long long ageSec = HangWatchdog_HeartbeatAgeSec();
+            if (ageSec >= 0 && ageSec >= (long long)g_heartbeatStaleSec) {
+                if (!triggeredHeartbeatAction) {
+                    triggeredHeartbeatAction = true;
+                    char reason[128];
+                    std::snprintf(reason, sizeof(reason),
+                                  "game-loop heartbeat stale for %llds",
+                                  ageSec);
+                    HangWatchdog_TakeAction(reason);
+                }
+            } else if (ageSec >= 0) {
+                // Reset the latch once heartbeat becomes fresh again so a
+                // subsequent stall can trigger a new dump.
+                triggeredHeartbeatAction = false;
+            }
+        }
     }
 }
 
@@ -1146,6 +1233,8 @@ static void InstallHangWatchdog() {
         (GetPrivateProfileIntA("HangWatchdog", "Enabled", 1, g_iniPath) != 0);
     int thresholdSec =
         GetPrivateProfileIntA("HangWatchdog", "HangThresholdSec", 30, g_iniPath);
+    int heartbeatSec =
+        GetPrivateProfileIntA("HangWatchdog", "HeartbeatStaleSec", 10, g_iniPath);
 
     char actionStr[32] = {0};
     GetPrivateProfileStringA("HangWatchdog", "Action", "dump",
@@ -1156,18 +1245,54 @@ static void InstallHangWatchdog() {
     else if (_stricmp(actionStr, "dumpAndKill") == 0)  g_hangAction = kHangAction_DumpAndKill;
     else                                                g_hangAction = kHangAction_Dump;
 
-    Log("[watchdog] Enabled=%d ThresholdSec=%d Action=%s",
-        (int)g_hangEnabled, thresholdSec, actionStr);
+    Log("[watchdog] Enabled=%d ThresholdSec=%d HeartbeatStaleSec=%d Action=%s",
+        (int)g_hangEnabled, thresholdSec, heartbeatSec, actionStr);
 
     if (!g_hangEnabled) {
         Log("[watchdog] disabled by config.");
         return;
     }
 
-    // Clamp to sensible bounds (5s..1h)
+    // Clamp to sensible bounds (5s..1h for window hang, 0..1h for heartbeat)
     if (thresholdSec < 5)    thresholdSec = 5;
     if (thresholdSec > 3600) thresholdSec = 3600;
     g_hangThresholdSec = (DWORD)thresholdSec;
+
+    if (heartbeatSec < 0)    heartbeatSec = 0;
+    if (heartbeatSec > 3600) heartbeatSec = 3600;
+    g_heartbeatStaleSec = (DWORD)heartbeatSec;
+
+    // Compute the heartbeat file path. memprofile.js writes it to
+    // <SkyrimDir>\Data\Platform\SkyMPFixes.heartbeat; we're at
+    // <SkyrimDir>\Data\SKSE\Plugins so back up two levels.
+    if (g_dllDir[0]) {
+        char skyrimDir[MAX_PATH];
+        std::strncpy(skyrimDir, g_dllDir, MAX_PATH - 1);
+        skyrimDir[MAX_PATH - 1] = '\0';
+        // Trim "\Plugins"
+        for (int i = (int)std::strlen(skyrimDir) - 1; i >= 0; --i) {
+            if (skyrimDir[i] == '\\' || skyrimDir[i] == '/') {
+                skyrimDir[i] = '\0';
+                break;
+            }
+        }
+        // Trim "\SKSE"
+        for (int i = (int)std::strlen(skyrimDir) - 1; i >= 0; --i) {
+            if (skyrimDir[i] == '\\' || skyrimDir[i] == '/') {
+                skyrimDir[i] = '\0';
+                break;
+            }
+        }
+        // Trim "\Data"
+        for (int i = (int)std::strlen(skyrimDir) - 1; i >= 0; --i) {
+            if (skyrimDir[i] == '\\' || skyrimDir[i] == '/') {
+                skyrimDir[i] = '\0';
+                break;
+            }
+        }
+        std::snprintf(g_heartbeatPath, MAX_PATH,
+                      "%s\\Data\\Platform\\SkyMPFixes.heartbeat", skyrimDir);
+    }
 
     // Resolve IsHungAppWindow (user32). It's been there since Windows XP,
     // but we probe defensively anyway.
