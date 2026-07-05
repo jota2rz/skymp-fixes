@@ -44,6 +44,13 @@
 //    Crash site: VCRUNTIME140.dll+0x12251 (AVX2 memcpy)
 //    Caller: SkyrimSE.exe+0x2F782C (idle animation dispatch).
 //
+// 9. Terrain Manager Crash Fix (SkyrimSoulsRE JobThread race)
+//    Prevents CTD during initial world load when SkyrimSoulsRE's
+//    BGSTerrainManager update hook is dispatched on a JobThread
+//    before terrain data is initialized on the main thread.
+//    Crash site: SkyrimSE.exe+02AD242
+//    mov rax, [rcx] with rcx=0.
+//
 // 4. MpClientPlugin Shutdown Hang Fix
 //    Prevents the SkyrimSE.exe process from getting stuck forever (game
 //    window gone, only SkyrimPlatform Console visible, ~5-14 GB RAM held)
@@ -656,6 +663,83 @@ static LONG CALLBACK JobMemcpyExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     // Couldn't find a safe frame to return to -- let the crash proceed
     // so CrashLoggerSSE captures it and we get more info.
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 9: Terrain Manager NULL Deref During Load (SkyrimSoulsRE JobThread race)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Same JobThread-worker-vs-uninitialized-data race class as fixes 1/7/8 but
+// in the BGSTerrainManager path rather than an actor path. Triggered when
+// SkyrimSoulsRE's map-menu terrain-update hook
+// (SkyrimSoulsRE!MapMenuEx::BGSTerrainManager_Update_Hook, MapMenuEx.cpp:144)
+// dispatches a terrain update via BSJobs::JobThread and the worker runs
+// before the main thread finishes initializing the target cell's
+// TESObjectLAND / terrain-LOD texture chain.
+//
+// Observed almost exclusively at process uptime <30s (initial world load
+// right after character select). Heavy modlists + SkyrimSoulsRE make it
+// more likely.
+//
+// Crash example:
+//   SkyrimSE.exe+0x02AD242   mov rax, [rcx]      ; RCX = NULL
+//   Objects in scope: TESObjectLAND, NiSourceTextures for terrain LOD
+//                     tiles, TESObjectCELLs ("Wilderness"), TESWorldSpace
+//                     "Skyrim", BSJobs::JobThread.
+//
+// Recovery: same trick as FIX 7 -- unwind to the JobThread dispatcher frame
+// so the dispatcher treats the work item as "done" and moves on. Fallback:
+// skip the 3-byte `mov rax, [rcx]` (encoding 48 8B 01) and zero RAX so the
+// immediate caller sees "no data" (one frame of missing terrain, then the
+// main thread's own update cycle populates it correctly).
+
+static constexpr uintptr_t kTerrainJobCrashOffset  = 0x02AD242;
+static constexpr uint32_t  kTerrainJobCrashInsnLen = 3;  // 48 8B 01
+
+static LONG CALLBACK TerrainJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
+    const auto* rec = a_ex->ExceptionRecord;
+    auto*       ctx = a_ex->ContextRecord;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ctx->Rip != g_baseAddr + kTerrainJobCrashOffset)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ctx->Rcx != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Same recovery as fixes 7/8: unwind to the JobThread dispatcher frame.
+    uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+    uintptr_t safeReturn = 0;
+    uintptr_t safeRsp = 0;
+
+    for (int j = 0; j < 384; ++j) {
+        uintptr_t val = 0;
+        __try {
+            val = stack[j];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        if (IsInJobThreadDispatcher(val, g_baseAddr, g_moduleEnd)) {
+            safeReturn = val;
+            safeRsp = ctx->Rsp + (j + 1) * 8;
+            break;
+        }
+    }
+
+    if (safeReturn) {
+        ctx->Rip = safeReturn;
+        ctx->Rsp = safeRsp;
+        ctx->Rax = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Fallback: skip the 3-byte load and pretend the terrain field was 0.
+    // The caller checks the result for NULL and takes an early-out; the
+    // terrain tile will simply not render on this pass and the main
+    // thread's own update cycle will fill it in on the next tick.
+    ctx->Rip += kTerrainJobCrashInsnLen;
+    ctx->Rax  = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1589,8 +1673,9 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     AddVectoredExceptionHandler(1, TextureQueueExceptionHandler);
     AddVectoredExceptionHandler(1, MovementJobExceptionHandler);
     AddVectoredExceptionHandler(1, JobMemcpyExceptionHandler);
+    AddVectoredExceptionHandler(1, TerrainJobExceptionHandler);
     Log("[boot] Crash-fix exception handlers installed (FaceGen, WorldClean, "
-        "TextureQueue, MovementJob, JobMemcpy).");
+        "TextureQueue, MovementJob, JobMemcpy, TerrainJob).");
 
     // Install non-crash fixes
     InstallMpClientShutdownFix();
