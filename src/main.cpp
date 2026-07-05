@@ -1,4 +1,4 @@
-// SkyMP Fixes - Combined SKSE plugin for Skyrim SE 1.6.1170
+﻿// SkyMP Fixes - Combined SKSE plugin for Skyrim SE 1.6.1170
 //
 // Contains fixes for issues caused by SkyMP client's
 // aggressive actor spawn/delete patterns plus a shutdown-hang fix:
@@ -50,6 +50,14 @@
 //    before terrain data is initialized on the main thread.
 //    Crash site: SkyrimSE.exe+02AD242
 //    mov rax, [rcx] with rcx=0.
+//
+// 10. JobThread Dispatcher Crash Fix (SkyrimSoulsRE terrain race, variant)
+//    Prevents CTD when the JobThread dispatcher itself dequeues a NULL
+//    work item during the same SkyrimSoulsRE terrain race as fix 9.
+//    Recovery here kills just the affected worker thread since the
+//    dispatcher is the top-most frame we could unwind to.
+//    Crash site: SkyrimSE.exe+0CF7888
+//    mov ecx, [rbx+0x0C] with rbx=0.
 //
 // 4. MpClientPlugin Shutdown Hang Fix
 //    Prevents the SkyrimSE.exe process from getting stuck forever (game
@@ -105,8 +113,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
-// ── Minimal SKSE64 AE plugin API ───────────────────────────────────────────
+// â”€â”€ Minimal SKSE64 AE plugin API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 struct SKSEPluginVersionData {
     enum { kVersion = 1 };
@@ -129,7 +139,7 @@ struct SKSEInterface {
     uint32_t isEditor;
 };
 
-// ── Shared state ───────────────────────────────────────────────────────────
+// â”€â”€ Shared state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 static uintptr_t g_baseAddr   = 0;
 static uintptr_t g_moduleEnd  = 0;
@@ -210,13 +220,102 @@ static void Log(const char* fmt, ...) {
     LeaveCriticalSection(&g_logLock);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// FIX 1: FaceGen Crash (two variants)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Diagnostic counters for exception handlers (lock-free)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+//
+// Each handler bumps its slot on a successful absorb. A background thread
+// dumps deltas to the log every 5s if anything changed. We also emit ONE
+// "first fire" line per handler the moment it first fires, so we know
+// immediately what pattern the game is hitting during load.
+//
+// Counters are only touched from exception context, so lock-free atomics
+// only. Never call Log() from the fast path -- Log takes a critical
+// section that would serialize thousands of exception handler invocations.
 
-// Variant A: Corrupted vtable jump — RIP lands at garbage address,
+enum HandlerSlot {
+    kHS_FaceGen         = 0,
+    kHS_WorldClean      = 1,
+    kHS_TextureQueue    = 2,
+    kHS_MovementJob     = 3,
+    kHS_JobMemcpy       = 4,
+    kHS_TerrainJob      = 5,
+    kHS_JobDispatcher   = 6,
+    kHS_Count
+};
+
+static const char* const kHandlerNames[kHS_Count] = {
+    "FaceGen", "WorldClean", "TextureQueue", "MovementJob",
+    "JobMemcpy", "TerrainJob", "JobDispatcher"
+};
+
+static volatile LONG g_handlerFires[kHS_Count]      = {0};
+static volatile LONG g_handlerFirstLog[kHS_Count]   = {0};
+
+// Called from inside each handler right before returning
+// EXCEPTION_CONTINUE_EXECUTION. Never call Log() unless this is the FIRST
+// fire (guarded by CAS). Safe to call at very high frequency.
+static inline void DiagBumpHandler(HandlerSlot slot) {
+    InterlockedIncrement(&g_handlerFires[slot]);
+    if (InterlockedCompareExchange(&g_handlerFirstLog[slot], 1, 0) == 0) {
+        // First fire ever -- one log line so the user can immediately see
+        // that the handler is being triggered during load.
+        Log("[diag] handler '%s' first fired", kHandlerNames[slot]);
+    }
+}
+
+// Convenience: bump the counter and return EXCEPTION_CONTINUE_EXECUTION in
+// one shot, so each handler's absorb sites can just say
+// `return AbsorbAndReturn(kHS_XXX);` instead of duplicating the two lines.
+static inline LONG AbsorbAndReturn(HandlerSlot slot) {
+    DiagBumpHandler(slot);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Background thread that reports per-handler activity every 5s if it
+// changed. Also detects sustained-loop conditions (any handler firing
+// > 500 times in 5s => probably livelock).
+static DWORD WINAPI DiagStatsThread(LPVOID) {
+    LONG last[kHS_Count] = {0};
+    for (int iter = 0; iter < 720; ++iter) {  // 720 * 5s = 1h max
+        Sleep(5000);
+        char line[512] = {0};
+        char* p = line;
+        int changed = 0;
+        LONG maxDelta = 0;
+        int maxIdx = -1;
+        for (int i = 0; i < kHS_Count; ++i) {
+            LONG cur = g_handlerFires[i];
+            LONG d = cur - last[i];
+            if (d > 0) {
+                int n = std::snprintf(p, sizeof(line) - (p - line),
+                                      " %s=+%ld(%ld)",
+                                      kHandlerNames[i], d, cur);
+                if (n > 0) p += n;
+                changed++;
+                if (d > maxDelta) { maxDelta = d; maxIdx = i; }
+            }
+            last[i] = cur;
+        }
+        if (changed > 0) {
+            Log("[diag] 5s handler activity:%s", line);
+            if (maxDelta > 500) {
+                Log("[diag] WARNING: handler '%s' fired %ld times in 5s -- "
+                    "probable livelock, this handler needs a limit",
+                    kHandlerNames[maxIdx], maxDelta);
+            }
+        }
+    }
+    return 0;
+}
+
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// FIX 1: FaceGen Crash (two variants)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+// Variant A: Corrupted vtable jump â€” RIP lands at garbage address,
 //   stack has face gen return addresses.
-// Variant B: Invalid pointer in face gen helper — RIP is valid but a register
+// Variant B: Invalid pointer in face gen helper â€” RIP is valid but a register
 //   holds an invalid/sentinel value (e.g. 0xFFFFFFFF from failed lookup, or
 //   simply NULL because the owning actor 3D was torn down on another thread).
 //   Known crash sites:
@@ -248,8 +347,8 @@ struct FaceGenDirectSite {
 };
 
 static constexpr FaceGenDirectSite kFaceGenDirectSites[] = {
-    { 0x0429E69, 4, kFGBadReg_RDI_FFFFFFFF }, // C6 47 1C 01           — mov byte [rdi+0x1C], 1
-    { 0x04328E9, 3, kFGBadReg_RCX_Null     }, // 48 8B 01              — mov rax, [rcx]
+    { 0x0429E69, 4, kFGBadReg_RDI_FFFFFFFF }, // C6 47 1C 01           â€” mov byte [rdi+0x1C], 1
+    { 0x04328E9, 3, kFGBadReg_RCX_Null     }, // 48 8B 01              â€” mov rax, [rcx]
 };
 
 static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
@@ -276,7 +375,7 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
 
         // Unwind to the first stack-frame return address that lives outside
-        // the FaceGen helper range — that caller is prepared to handle a
+        // the FaceGen helper range â€” that caller is prepared to handle a
         // "not found / null" result from this helper chain.
         uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
         uintptr_t safeReturn = 0;
@@ -295,13 +394,13 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             ctx->Rip = safeReturn;
             ctx->Rsp = safeRsp;
             ctx->Rax = 0;
-            return EXCEPTION_CONTINUE_EXECUTION;
+            return AbsorbAndReturn(kHS_FaceGen);
         }
 
         // Fallback: just skip the faulting instruction and zero the result.
         ctx->Rip += site.insnLen;
         ctx->Rax  = 0;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        return AbsorbAndReturn(kHS_FaceGen);
     }
 
     // Variant A: RIP at non-executable address (corrupted vtable / function
@@ -309,11 +408,11 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     //
     // Two sub-flavours we have to recognise:
     //
-    //   A.1 "garbage RIP" — RIP lands at a completely bogus address outside
+    //   A.1 "garbage RIP" â€” RIP lands at a completely bogus address outside
     //       any loaded module (e.g. 0x000003480001). Caught by the heuristic
     //       gates below.
     //
-    //   A.2 "non-exec RIP inside SkyrimSE" (added 2026-06-25) — the
+    //   A.2 "non-exec RIP inside SkyrimSE" (added 2026-06-25) â€” the
     //       corrupted pointer happens to land at a valid-looking SkyrimSE
     //       offset that is read-only data (e.g. +0x32580C4 -- two zero bytes
     //       which disassemble as 'add [rax], al'). The CPU raises an
@@ -370,19 +469,19 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         ctx->Rip = stack[0];
         ctx->Rsp += 8;
         ctx->Rax = 0;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        return AbsorbAndReturn(kHS_FaceGen);
     }
 
     // Unwind to the safe return point
     ctx->Rip = safeReturn;
     ctx->Rsp = safeRsp;
     ctx->Rax = 0;
-    return EXCEPTION_CONTINUE_EXECUTION;
+    return AbsorbAndReturn(kHS_FaceGen);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 2: WorldClean Crash (NPC deletion during cell init)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 // Crash offsets: cmp dword ptr [rax+0x08], imm8 (4 bytes each)
 static constexpr uintptr_t kWorldCleanOffsets[] = { 0x02D1922, 0x02D19A1 };
@@ -398,17 +497,17 @@ static LONG CALLBACK WorldCleanExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     for (auto offset : kWorldCleanOffsets) {
         if (ctx->Rip == g_baseAddr + offset) {
             ctx->Rip    += kWorldCleanInsnLen;
-            ctx->EFlags &= ~0x40u;  // clear ZF → "type mismatch" path
-            return EXCEPTION_CONTINUE_EXECUTION;
+            ctx->EFlags &= ~0x40u;  // clear ZF â†’ "type mismatch" path
+            return AbsorbAndReturn(kHS_WorldClean);
         }
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 3: Texture Queue Crash (BSTaskManagerThread null deref)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // Crash at SkyrimSE.exe+0E02786: mov rax, [rcx+0x28]  (RCX=0)
 // This is in function 75739 (texture queue processing on BSTaskManagerThread).
@@ -420,17 +519,17 @@ static LONG CALLBACK WorldCleanExceptionHandler(EXCEPTION_POINTERS* a_ex) {
 //
 // Fix: If RIP matches the crash site and RCX==0, skip the instruction and
 // set RAX=0. The caller (function 75636 at +0DFDA00) sets state to 0x05
-// then checks the result — a null return causes it to skip processing
+// then checks the result â€” a null return causes it to skip processing
 // this queue entry gracefully.
 //
 // Additionally, a second null check at +0E02792: mov rcx, [rbx+0x20]
-// In the crash log this appears as the next frame — if RBX's queued entry
+// In the crash log this appears as the next frame â€” if RBX's queued entry
 // has a null member at +0x20, the subsequent deref of that will also crash.
 // We handle both sites.
 
 static constexpr uintptr_t kTexQueueOffsets[] = {
-    0x0E02786,  // mov rax, [rcx+0x28] — primary crash site
-    0x0E02792,  // mov rcx, [rbx+0x20] — secondary (next instruction after check)
+    0x0E02786,  // mov rax, [rcx+0x28] â€” primary crash site
+    0x0E02792,  // mov rcx, [rbx+0x20] â€” secondary (next instruction after check)
 };
 
 static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
@@ -446,7 +545,7 @@ static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             // Skip the instruction (4 bytes: 48 8B 41 28)
             ctx->Rip += 4;
             ctx->Rax  = 0;
-            return EXCEPTION_CONTINUE_EXECUTION;
+            return AbsorbAndReturn(kHS_TextureQueue);
         }
     }
 
@@ -464,7 +563,7 @@ static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
                 (mbi.State == MEM_COMMIT) &&
                 (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
                 if (*memberPtr == 0) {
-                    // [rbx+0x20] is null — loading it into RCX will cause
+                    // [rbx+0x20] is null â€” loading it into RCX will cause
                     // the primary crash site to fire on next iteration.
                     // Skip instruction (4 bytes: 48 8B 4B 20) and set RCX=0,
                     // then let the primary handler catch it, OR just unwind.
@@ -475,7 +574,7 @@ static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
                     // the whole sequence by returning to the caller.
                     // Actually, let's just skip this instruction. The primary
                     // handler will catch the next one if needed.
-                    return EXCEPTION_CONTINUE_EXECUTION;
+                    return AbsorbAndReturn(kHS_TextureQueue);
                 }
             }
         }
@@ -484,9 +583,9 @@ static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 7: MovementController Job Crash (same class as FaceGen, different site)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // Crash at SkyrimSE.exe+0x0783642:
 //   cmp qword ptr [rcx+0x1F8], 0x00        (8 bytes: 48 83 B9 F8 01 00 00 00)
@@ -524,7 +623,11 @@ static bool IsInJobThreadDispatcher(uintptr_t addr, uintptr_t baseAddr,
     if (addr < baseAddr || addr >= moduleEnd)
         return false;
     uintptr_t off = addr - baseAddr;
-    return off >= 0x00CF6000 && off <= 0x00CF8000;
+    // Widened 2026-07-05 from +0xCF6000..+0xCF8000 after observing crashes
+    // at +0xCF813E and +0xCF78A7 (both inside the same BSJobs::JobThread
+    // dispatcher function). A generous +0xCF6000..+0xCF9000 covers the
+    // whole dispatcher including future sites we haven't seen yet.
+    return off >= 0x00CF6000 && off <= 0x00CF9000;
 }
 
 static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
@@ -558,7 +661,7 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         ctx->Rip = safeReturn;
         ctx->Rsp = safeRsp;
         ctx->Rax = 0;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        return AbsorbAndReturn(kHS_MovementJob);
     }
 
     // Fallback: skip the compare and pretend [rcx+0x1F8] was 0.
@@ -567,12 +670,12 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     ctx->Rip    += kMovementJobCrashInsnLen;
     ctx->EFlags |= 0x40u;  // set ZF
     ctx->Rax     = 0;
-    return EXCEPTION_CONTINUE_EXECUTION;
+    return AbsorbAndReturn(kHS_MovementJob);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 8: JobThread Crash Inside CRT memcpy (Idle Animation Variant)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // Third variant of the same actor-delete race as FIX 1 (FaceGen) and FIX 7
 // (MovementController). This time the JobThread work item is dispatching
@@ -657,7 +760,7 @@ static LONG CALLBACK JobMemcpyExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         ctx->Rip = safeReturn;
         ctx->Rsp = safeRsp;
         ctx->Rax = 0;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        return AbsorbAndReturn(kHS_JobMemcpy);
     }
 
     // Couldn't find a safe frame to return to -- let the crash proceed
@@ -665,9 +768,9 @@ static LONG CALLBACK JobMemcpyExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 9: Terrain Manager NULL Deref During Load (SkyrimSoulsRE JobThread race)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // Same JobThread-worker-vs-uninitialized-data race class as fixes 1/7/8 but
 // in the BGSTerrainManager path rather than an actor path. Triggered when
@@ -696,6 +799,15 @@ static LONG CALLBACK JobMemcpyExceptionHandler(EXCEPTION_POINTERS* a_ex) {
 static constexpr uintptr_t kTerrainJobCrashOffset  = 0x02AD242;
 static constexpr uint32_t  kTerrainJobCrashInsnLen = 3;  // 48 8B 01
 
+// Livelock guard: this specific race can repeat many times a second while
+// terrain init is running. If we absorb it indefinitely the game appears
+// frozen (JobThread just crashes -> recover -> crashes again and never
+// makes progress on real work). After this many recoveries, stop absorbing
+// and let the crash propagate so the user gets a normal crash log instead
+// of a mystery hang, and the watchdog / user can restart cleanly.
+static constexpr LONG kTerrainJobMaxRecoveries = 200;
+static volatile LONG  g_terrainJobRecoveries   = 0;
+
 static LONG CALLBACK TerrainJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     const auto* rec = a_ex->ExceptionRecord;
     auto*       ctx = a_ex->ContextRecord;
@@ -706,6 +818,21 @@ static LONG CALLBACK TerrainJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         return EXCEPTION_CONTINUE_SEARCH;
     if (ctx->Rcx != 0)
         return EXCEPTION_CONTINUE_SEARCH;
+
+    // Track how many times we've absorbed this crash. If we cross the
+    // threshold, stop absorbing so the underlying bug becomes visible.
+    // Do NOT call Log() here on the fast path -- Log takes a critical
+    // section and this handler can fire hundreds of times per second.
+    LONG n = InterlockedIncrement(&g_terrainJobRecoveries);
+    if (n > kTerrainJobMaxRecoveries) {
+        // Only log the "giving up" line once (n == threshold + 1), then
+        // let this and all subsequent occurrences crash normally.
+        if (n == kTerrainJobMaxRecoveries + 1) {
+            Log("[fix9] terrain-race absorbed %ld times without progress -- "
+                "giving up so the crash becomes visible", n - 1);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // Same recovery as fixes 7/8: unwind to the JobThread dispatcher frame.
     uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
@@ -730,7 +857,7 @@ static LONG CALLBACK TerrainJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         ctx->Rip = safeReturn;
         ctx->Rsp = safeRsp;
         ctx->Rax = 0;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        return AbsorbAndReturn(kHS_TerrainJob);
     }
 
     // Fallback: skip the 3-byte load and pretend the terrain field was 0.
@@ -739,12 +866,171 @@ static LONG CALLBACK TerrainJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     // thread's own update cycle will fill it in on the next tick.
     ctx->Rip += kTerrainJobCrashInsnLen;
     ctx->Rax  = 0;
-    return EXCEPTION_CONTINUE_EXECUTION;
+    return AbsorbAndReturn(kHS_TerrainJob);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// FIX 10: JobThread Dispatcher NULL Deref (SkyrimSoulsRE terrain race, variant)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+//
+// Fifth variant of the SkyrimSoulsRE-2.4 terrain-load race we've been
+// hunting. Unlike fixes 1/7/8/9 which crash somewhere INSIDE work that a
+// BSJobs::JobThread dispatched, this one crashes INSIDE the dispatcher
+// itself -- the dispatcher pops a work item from its queue and gets garbage
+// (NULL or a tiny integer) back, then dereferences it.
+//
+// The dispatcher function is ~3 KB of code with MANY pointer-following
+// instructions, and depending on tiny timing differences the "first" one
+// to hit the garbage input varies from run to run. Sites seen so far
+// (all inside +0xCF6000..+0xCF9000):
+//   +0x0CF7888   mov ecx, [rbx+0x0C]     ; RBX = 0
+//   +0x0CF78A7   lock xadd [rdx], rax    ; RDX = 2   (page-0 tiny int)
+//   +0x0CF813E   mov r11d, [r14+0xA6C]   ; R14 = 0x18 (page-0 tiny int)
+//   ... and probably more.
+//
+// Common stack shape for all of them:
+//   [0] this crash site
+//   [1] +0x0CF7E51 or +0x0CF61DA   (dispatcher inner/outer caller)
+//   [2] +0x0CD0DBD                 (pool scheduler outer loop)
+//   [3] KERNEL32
+//
+// History (2026-07-05):
+//   Attempt A: ExitThread(0). Froze the process (loader-lock deadlock).
+//   Attempt B: unwind to a frame OUTSIDE the dispatcher tight range.
+//              Silent process death (__fastfail on stack cookie).
+//   Attempt C: skip-and-continue at the specific instruction. Ran further
+//              into the dispatcher but chain-crashed at the NEXT bad-pointer
+//              site (~30 bytes later).
+//   Attempt D: like Fix 7/8/9 -- unwind to a return address INSIDE the
+//              dispatcher range. Worked for the first site, but was gated
+//              by a specific RIP+register check, so a NEW site (+0xCF813E)
+//              in a subsequent run flew right past.
+//   Attempt E (current): SITE-AGNOSTIC. Trigger on ANY EAV whose
+//              RIP is inside IsInJobThreadDispatcher AND whose fault
+//              address is page-0 tiny int (< 0x10000). That signature is
+//              specific to a garbage pointer coming from the race and
+//              won't mask real memory corruption. Recovery is still the
+//              Fix 7/8/9-style in-range unwind.
+
+static constexpr LONG kJobDispatcherMaxRecoveries = 200;
+static volatile LONG  g_jobDispatcherRecoveries   = 0;
+
+static LONG CALLBACK JobDispatcherExceptionHandler(EXCEPTION_POINTERS* a_ex) {
+    const auto* rec = a_ex->ExceptionRecord;
+    auto*       ctx = a_ex->ContextRecord;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Trigger: RIP inside the dispatcher function.
+    if (!IsInJobThreadDispatcher(ctx->Rip, g_baseAddr, g_moduleEnd))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Fault address must be a page-0 tiny integer -- the signature of a
+    // garbage pointer that came from the terrain race. Real memory
+    // corruption elsewhere in the dispatcher wouldn't have this shape and
+    // shouldn't be silently masked.
+    if (rec->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t faultAddr = rec->ExceptionInformation[1];
+    if (faultAddr >= 0x10000ULL)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Livelock guard.
+    LONG n = InterlockedIncrement(&g_jobDispatcherRecoveries);
+    if (n > kJobDispatcherMaxRecoveries) {
+        if (n == kJobDispatcherMaxRecoveries + 1) {
+            Log("[fix10] JobDispatcher NULL-deref absorbed %ld times without "
+                "progress -- giving up so the crash becomes visible", n - 1);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Unwind: find a return address on the stack that we can safely jump
+    // to. Two acceptable classes, in order of preference:
+    //   (a) A return address INSIDE the dispatcher range (Fix 7/8/9 pattern)
+    //   (b) A return address in the pool-scheduler function
+    //       (+0xCD0000..+0xCD1500), VALIDATED to be immediately after a
+    //       relative CALL (0xE8 five bytes before) so we don't mistake a
+    //       stray data pointer for a return address. Attempt B silently
+    //       __fastfailed exactly because it skipped this validation.
+    //
+    // Class (b) only applies when the crash is at the outermost dispatcher
+    // frame -- there IS no inner dispatcher return address on the stack.
+    // Otherwise class (a) always wins.
+    uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+    uintptr_t safeReturn = 0;
+    uintptr_t safeRsp = 0;
+
+    // Pass 1: dispatcher-range return address.
+    for (int j = 0; j < 384; ++j) {
+        uintptr_t val = 0;
+        __try {
+            val = stack[j];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        // Only accept a dispatcher-range return address AND require it to
+        // be strictly past the crashing RIP -- returning to something
+        // "before" the crash would loop us right back into it.
+        if (val != ctx->Rip &&
+            IsInJobThreadDispatcher(val, g_baseAddr, g_moduleEnd)) {
+            safeReturn = val;
+            safeRsp = ctx->Rsp + (j + 1) * 8;
+            break;
+        }
+    }
+
+    // Pass 1 acting block: if we found an in-range dispatcher frame,
+    // unwind there. This is the same pattern as Fix 7/8/9 and is safe.
+    if (safeReturn) {
+        ctx->Rip = safeReturn;
+        ctx->Rsp = safeRsp;
+        ctx->Rax = 0;
+        return AbsorbAndReturn(kHS_JobDispatcher);
+    }
+
+    // Pass 2 (pool-scheduler return-address unwind) REMOVED 2026-07-05.
+    //
+    // History of attempts for the outermost-dispatcher-frame case (where
+    // there is NO in-range return address on the stack, only +0xCD0DBD-ish
+    // return addresses to the pool scheduler outside the tight dispatcher
+    // range):
+    //
+    //   Attempt B: unwind to any SkyrimSE address outside dispatcher
+    //              -> silent __fastfail (stack cookie mismatch)
+    //   Attempt E: unwind to pool-scheduler range with strict CALL-byte
+    //              validation
+    //              -> some CALL encodings rejected; crash still propagated
+    //   Attempt F: same, broadened CALL-byte whitelist
+    //              -> still rejected FF /2 mod=01 encoding; crash propagated
+    //   Attempt G: same, no CALL validation (tight 5 KB range only)
+    //              -> unwind succeeded 3-4 times cleanly; game then FROZE
+    //                 (black screen, watchdog blocked, whole process hung).
+    //                 CALL bytes captured were `FF 50 08` -- valid, unwind
+    //                 was mechanically correct, but the pool scheduler
+    //                 receiving "job done" for a job that DIDN'T actually
+    //                 complete leaves other threads waiting forever.
+    //
+    // Conclusion: absorbing this specific class of crash (outermost
+    // dispatcher frame) is fundamentally unsafe -- the pool scheduler's
+    // "job completed" bookkeeping is a lie, and something else in the
+    // engine waits on genuine completion. A silent freeze is strictly
+    // WORSE for the user than a clean CrashLoggerSSE-captured crash.
+    //
+    // So: no Pass 2. If Pass 1 didn't find an in-range frame, let the
+    // exception propagate. CrashLoggerSSE writes the log, the process
+    // exits cleanly, the user restarts.
+    //
+    // If a future SkyrimSoulsRE update (or a manual fix in that mod's
+    // source) resolves the underlying terrain race, this whole handler
+    // becomes unnecessary. That's the RIGHT layer to fix this at.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 4: MpClientPlugin DllMain Shutdown Hang
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // During ExitProcess, the loader calls DLL_PROCESS_DETACH on each DLL.
 // MpClientPlugin's CRT runs static destructors which destroy a static
@@ -931,9 +1217,9 @@ static void InstallMpClientShutdownFix() {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 5: V8 JavaScript Heap Limit (configurable via SkyMPFixes.ini)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // V8 (inside libnode.dll, loaded by SkyrimPlatformImpl.dll) chooses its
 // `max-old-space-size` automatically based on physical RAM. On x64 the
@@ -1235,9 +1521,9 @@ static void InstallV8HeapLimitFix() {
         g_dllNotifyCookie);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // FIX 6: Hang Watchdog (configurable via SkyMPFixes.ini)
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
 // When a SkyrimPlatform hook is called on the game's main thread and the JS
 // worker pool is exhausted (or a JS handler is slow), the game locks up
@@ -1627,9 +1913,9 @@ static void InstallHangWatchdog() {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SKSE Entry Points
-// ════════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #define RUNTIME_1_6_1170 ((1u << 24) | (6u << 16) | (1170u << 4))
 
@@ -1674,8 +1960,16 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     AddVectoredExceptionHandler(1, MovementJobExceptionHandler);
     AddVectoredExceptionHandler(1, JobMemcpyExceptionHandler);
     AddVectoredExceptionHandler(1, TerrainJobExceptionHandler);
+    AddVectoredExceptionHandler(1, JobDispatcherExceptionHandler);
     Log("[boot] Crash-fix exception handlers installed (FaceGen, WorldClean, "
-        "TextureQueue, MovementJob, JobMemcpy, TerrainJob).");
+        "TextureQueue, MovementJob, JobMemcpy, TerrainJob, JobDispatcher).");
+
+    // Diagnostic stats thread -- reports which handlers are firing and
+    // flags likely livelocks. Cheap; low priority; auto-exits after 1h.
+    if (HANDLE t = CreateThread(nullptr, 0, &DiagStatsThread, nullptr, 0, nullptr)) {
+        CloseHandle(t);
+        Log("[diag] handler-stats thread started (5s reporting interval)");
+    }
 
     // Install non-crash fixes
     InstallMpClientShutdownFix();

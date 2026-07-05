@@ -162,7 +162,10 @@
     'heap_limit_mb,external_mb,arraybuffers_mb,storage_keys,' +
     'worldmodel_forms,' +
     'frame_count,frame_min_ms,frame_avg_ms,frame_max_ms,hitches_ge_' +
-    HITCH_THRESHOLD_MS + 'ms\n';
+    HITCH_THRESHOLD_MS + 'ms,' +
+    'actors_total,actors_near_2k,actors_near_5k,actors_near_10k,' +
+    'cell,player_x,player_y,player_z,' +
+    'ourjs_avg_ms,ourjs_max_ms\n';
   try {
     var needHeader = true;
     try {
@@ -211,6 +214,13 @@
   var frameMinMs    = 0;
   var frameMaxMs    = 0;
   var frameHitches  = 0;
+  // Time spent INSIDE our own on('update') callback (JS-side overhead of
+  // this plugin). Distinguishes "the frame is slow because game code /
+  // other SP plugins are slow" from "the frame is slow because OUR JS is
+  // slow" -- the latter would be a bug in this profiler, but confirming
+  // it's NOT us is useful signal.
+  var ourJsSumMs    = 0;
+  var ourJsMaxMs    = 0;
   // Guard: if the window is minimized or the game is paused for a long
   // time, SP stops firing "update" and the next tick's gap is huge. That's
   // not a hitch we care about, so cap what we count as a "real" frame gap.
@@ -225,9 +235,16 @@
     if (gapMs >= HITCH_THRESHOLD_MS) frameHitches++;
   }
 
+  function recordOurJsTime(ms) {
+    if (ms <= 0 || ms > FRAME_GAP_CAP_MS) return;
+    ourJsSumMs += ms;
+    if (ms > ourJsMaxMs) ourJsMaxMs = ms;
+  }
+
   function resetFrameAccum() {
     frameCount = 0; frameSumMs = 0; frameMinMs = 0; frameMaxMs = 0;
     frameHitches = 0;
+    ourJsSumMs = 0; ourJsMaxMs = 0;
   }
 
   function logHitch(now, gapMs) {
@@ -273,6 +290,181 @@
     } catch (e) { return -1; }
   }
 
+  // Locate SkyMP's worldModel.forms once per call. Returns the array or null.
+  // Cached lookup path is faster than getWorldModelFormCount because we don't
+  // walk both storage keys twice.
+  function getWorldModelForms() {
+    try {
+      // Path A: sp.storage (older SkyMP builds).
+      var s = null;
+      try { s = sp.storage; } catch (_) {}
+      if (s) {
+        if (s.worldModel && s.worldModel.forms) return s.worldModel.forms;
+        if (s._worldModel && s._worldModel.forms) return s._worldModel.forms;
+        var rs = s['remoteServer'];
+        if (rs && rs.worldModel && rs.worldModel.forms) return rs.worldModel.forms;
+      }
+      // Path B: sp global itself (newer builds stash it here).
+      if (sp.worldModel && sp.worldModel.forms) return sp.worldModel.forms;
+      if (sp._worldModel && sp._worldModel.forms) return sp._worldModel.forms;
+      // Path C: global (Node's global). Some SkyMP builds attach it here.
+      if (typeof global !== 'undefined') {
+        if (global.worldModel && global.worldModel.forms) return global.worldModel.forms;
+        if (global.__skympWorldModel && global.__skympWorldModel.forms) return global.__skympWorldModel.forms;
+        // Some builds keep it inside a "skymp" namespace.
+        if (global.skymp && global.skymp.worldModel && global.skymp.worldModel.forms) {
+          return global.skymp.worldModel.forms;
+        }
+      }
+      return null;
+    } catch (e) { return null; }
+  }
+
+  // Player position (for distance-gated actor counts). Returns [x,y,z] or
+  // null if the player isn't available yet (main menu, load screen).
+  function getPlayerPos() {
+    try {
+      var Game = sp.Game;
+      if (!Game || typeof Game.getPlayer !== 'function') return null;
+      var pl = Game.getPlayer();
+      if (!pl) return null;
+      // getPositionX/Y/Z are cheap native calls.
+      return [pl.getPositionX(), pl.getPositionY(), pl.getPositionZ()];
+    } catch (e) { return null; }
+  }
+
+  // Current cell editor ID + world-space coords, if reachable. Correlates
+  // FPS drops with specific in-game locations. Returns { cell, x, y, z } or
+  // { cell: '', x/y/z: 0 } on failure so CSV columns stay populated.
+  function getPlayerCellInfo() {
+    var out = { cell: '', x: 0, y: 0, z: 0 };
+    try {
+      var Game = sp.Game;
+      if (!Game || typeof Game.getPlayer !== 'function') return out;
+      var pl = Game.getPlayer();
+      if (!pl) return out;
+      try {
+        out.x = Math.round(pl.getPositionX());
+        out.y = Math.round(pl.getPositionY());
+        out.z = Math.round(pl.getPositionZ());
+      } catch (_) {}
+      try {
+        var cell = pl.getParentCell();
+        if (cell) {
+          // Try methods in order of usefulness: prefer a human-readable
+          // editorID / name, fall back to hex formID.
+          var attempts = [
+            function () { return cell.getFormEditorID && cell.getFormEditorID(); },
+            function () { return cell.getName && cell.getName(); },
+            function () {
+              return cell.getFormID
+                ? '0x' + cell.getFormID().toString(16)
+                : null;
+            }
+          ];
+          for (var i = 0; i < attempts.length; i++) {
+            try {
+              var v = attempts[i]();
+              if (v !== null && v !== undefined && String(v).length > 0) {
+                out.cell = String(v);
+                break;
+              }
+            } catch (_) { /* try next */ }
+          }
+        }
+      } catch (_) {}
+    } catch (_) {}
+    return out;
+  }
+
+  // Count synced ACTORS in the world model, plus a distance-gated subset.
+  // A form is an "actor" if it has a .movement field (only movable/live
+  // entities have that in SkyMP's schema; static objects don't). Returns:
+  //   [totalActors, near2k, near5k, near10k]
+  // near_XX_k = actor forms within (XX * 1024) game units of the player,
+  // matching Skyrim's typical "activity radius" units (1 game unit ~ 1.4 cm).
+  //
+  // Distance is squared to skip a sqrt per form. Threshold constants below
+  // are already squared.
+  //
+  // Fallback: if SkyMP's world model isn't reachable (sp.storage empty in
+  // this build), estimate visible actor count by calling FindRandomActor
+  // several times at each radius and collecting unique form IDs. This
+  // saturates around 8-15 for large populations but is enough to
+  // distinguish "empty area" from "crowd".
+  function getActorNearCounts() {
+    var totals = [-1, -1, -1, -1];
+
+    // Path A: SkyMP world model iteration.
+    try {
+      var forms = getWorldModelForms();
+      if (forms && forms.length > 0) {
+        var total = 0, near2k = 0, near5k = 0, near10k = 0;
+        var pos = getPlayerPos();
+        var haveDist = pos && isFinite(pos[0]);
+        var px = haveDist ? pos[0] : 0;
+        var py = haveDist ? pos[1] : 0;
+        var pz = haveDist ? pos[2] : 0;
+        var R2_2K  = 2048.0  * 2048.0;
+        var R2_5K  = 5120.0  * 5120.0;
+        var R2_10K = 10240.0 * 10240.0;
+        for (var i = 0; i < forms.length; i++) {
+          var f = forms[i];
+          if (!f || !f.movement) continue;
+          total++;
+          if (!haveDist) continue;
+          var mp = f.movement.pos;
+          if (!mp || mp.length < 3) continue;
+          var dx = mp[0] - px, dy = mp[1] - py, dz = mp[2] - pz;
+          var d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 <= R2_2K)  near2k++;
+          if (d2 <= R2_5K)  near5k++;
+          if (d2 <= R2_10K) near10k++;
+        }
+        totals[0] = total;
+        totals[1] = haveDist ? near2k  : -1;
+        totals[2] = haveDist ? near5k  : -1;
+        totals[3] = haveDist ? near10k : -1;
+        return totals;
+      }
+    } catch (e) { /* fall through to statistical estimate */ }
+
+    // Path B: statistical estimate via FindRandomActor. Skyrim's Papyrus
+    // Game.FindRandomActor returns a random actor within `radius` of the
+    // given point. Call it many times per radius and collect unique
+    // form IDs -- gives us a "seen count" that saturates near the true
+    // population size after enough samples.
+    //
+    // This is an ESTIMATE, not a count. But changes to it correlate with
+    // real changes in crowd size. -1 elsewhere still means "no info".
+    try {
+      var pos2 = getPlayerPos();
+      if (!pos2 || !isFinite(pos2[0])) return totals;
+      if (!sp.Game || typeof sp.Game.FindRandomActor !== 'function') return totals;
+
+      var SAMPLES_PER_RADIUS = 12;   // 12 tries -> saturates ~10-12 unique
+      function estimateAt(radius) {
+        var seen = {};
+        for (var k = 0; k < SAMPLES_PER_RADIUS; k++) {
+          var a = null;
+          try {
+            a = sp.Game.FindRandomActor(pos2[0], pos2[1], pos2[2], radius);
+          } catch (_) {}
+          if (!a) continue;
+          var id = 0;
+          try { id = a.getFormID(); } catch (_) { continue; }
+          if (id) seen[id] = 1;
+        }
+        return Object.keys(seen).length;
+      }
+      totals[1] = estimateAt(2048);
+      totals[2] = estimateAt(5120);
+      totals[3] = estimateAt(10240);
+      // totals[0] stays -1 (we don't have a true total from this estimator).
+    } catch (e) { /* leave -1s */ }
+    return totals;
+  }
+
   function sample() {
     try {
       var mem = (typeof process !== 'undefined' && process.memoryUsage)
@@ -286,6 +478,16 @@
 
       var frameAvgMs = frameCount > 0
         ? Math.round((frameSumMs / frameCount) * 10) / 10 : 0;
+
+      // Actor counts: [total, near_2k, near_5k, near_10k]. Any -1 means the
+      // probe couldn't reach the required data (world model not initialised,
+      // or player not yet loaded).
+      var actors = getActorNearCounts();
+
+      // Cell / position info. `cell` may contain commas or quotes in weird
+      // mods -- strip them so we don't corrupt the CSV column layout.
+      var loc = getPlayerCellInfo();
+      var cellSafe = (loc.cell || '').replace(/[",\r\n]/g, '_');
 
       var line =
         ts + ',' +
@@ -302,7 +504,17 @@
         (Math.round(frameMinMs * 10) / 10) + ',' +
         frameAvgMs + ',' +
         (Math.round(frameMaxMs * 10) / 10) + ',' +
-        frameHitches + '\n';
+        frameHitches + ',' +
+        actors[0] + ',' + actors[1] + ',' + actors[2] + ',' + actors[3] + ',' +
+        cellSafe + ',' + loc.x + ',' + loc.y + ',' + loc.z + ',' +
+        // OurJS overhead: avg = ourJsSumMs / frameCount, max = ourJsMaxMs.
+        // If ourjs_avg_ms is well below frame_avg_ms, the frame slowdown is
+        // NOT in this profiler's JS -- it's game code or other SP plugins.
+        (frameCount > 0
+          ? (Math.round((ourJsSumMs / frameCount) * 100) / 100)
+          : 0) + ',' +
+        (Math.round(ourJsMaxMs * 100) / 100) +
+        '\n';
 
       fs.appendFileSync(CSV_PATH, line, { encoding: 'utf8' });
 
@@ -325,6 +537,140 @@
   // Take one sample immediately so even very short sessions log SOMETHING.
   sample();
   writeBootLine('first sample taken');
+
+  // ----- One-shot SkyrimPlatform API shape dump --------------------------
+  // Dumps top-level keys of sp, sp.storage, sp.Game, sp.Actor, sp.Cell, and
+  // sp.mpClientPlugin to the boot log so we can see what actually exists in
+  // this SP build and design future probes accordingly. Never call on the
+  // hot path -- once per session only.
+  //
+  // The Papyrus-native tests (getPlayer/getParentCell/getFormEditorID) MUST
+  // run on the game thread, i.e. from inside an sp.on('update') callback.
+  // Calling them from module-top-level (Node thread) throws
+  //   "'Form.getName' can't be called in this context"
+  // So we defer the game-thread probes to the first `update` firing below.
+  var apiDumpDone = false;
+  function dumpApiShape() {
+    try {
+      var dumpKeys = function (label, obj) {
+        try {
+          if (obj === null || typeof obj === 'undefined') {
+            writeBootLine('api-shape ' + label + ': (null/undefined)');
+            return;
+          }
+          var keys = null;
+          try { keys = Object.keys(obj); } catch (_) { keys = null; }
+          if (!keys) {
+            writeBootLine('api-shape ' + label + ': keys() threw');
+            return;
+          }
+          var head = keys.slice(0, 40).join(',');
+          writeBootLine('api-shape ' + label + ' (' + keys.length + ' keys): ' + head);
+        } catch (e) {
+          writeBootLine('api-shape ' + label + ' failed: ' + (e && e.message));
+        }
+      };
+      dumpKeys('sp',                    sp);
+      dumpKeys('sp.storage',            (function () { try { return sp.storage; } catch (_) { return null; } })());
+      dumpKeys('sp.mpClientPlugin',     sp.mpClientPlugin);
+      dumpKeys('sp.hooks',              sp.hooks);
+      dumpKeys('sp.browser',            sp.browser);
+      dumpKeys('global',                (typeof global !== 'undefined' ? global : null));
+
+      // Some SkyMP client builds ship obfuscated -- the module wrappers
+      // show up on `global` as `a0_XXXX` names. Dump each of those so we
+      // can find the one holding the world model / peer list.
+      if (typeof global !== 'undefined') {
+        try {
+          var gk = Object.keys(global);
+          for (var gi = 0; gi < gk.length; gi++) {
+            var name = gk[gi];
+            if (/^a\d+_0x[0-9a-f]+$/i.test(name)) {
+              try {
+                var g = global[name];
+                var t = typeof g;
+                if (g === null || t === 'undefined') {
+                  writeBootLine('api-shape global.' + name + ': null/undefined');
+                } else if (t === 'function') {
+                  writeBootLine('api-shape global.' + name + ': function/' +
+                    (g.length || 0) + ' args');
+                } else if (t === 'object') {
+                  var sub = Object.keys(g);
+                  writeBootLine('api-shape global.' + name +
+                    ' (obj, ' + sub.length + ' keys): ' +
+                    sub.slice(0, 30).join(','));
+                  // Look for likely world-model shapes inside.
+                  for (var si = 0; si < sub.length; si++) {
+                    var sname = sub[si];
+                    if (/world|forms?|players?|actors?|remote|peer/i.test(sname)) {
+                      try {
+                        var sv = g[sname];
+                        if (sv && typeof sv === 'object') {
+                          var svk = Object.keys(sv);
+                          writeBootLine('  -> ' + name + '.' + sname +
+                            ' (' + svk.length + ' keys): ' +
+                            svk.slice(0, 20).join(','));
+                        }
+                      } catch (_) {}
+                    }
+                  }
+                } else {
+                  writeBootLine('api-shape global.' + name + ': ' + t);
+                }
+              } catch (e) {
+                writeBootLine('api-shape global.' + name + ' probe threw: ' +
+                  (e && e.message));
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // Game-thread probes: getPlayer() and friends
+      try {
+        var pl = sp.Game.getPlayer();
+        if (pl) {
+          var nm = '?';
+          try { nm = pl.getName ? pl.getName() : '?'; } catch (_) { nm = '(getName threw)'; }
+          writeBootLine('api-shape sp.Game.getPlayer() -> OK (name="' + nm + '")');
+          // Dump ALL methods on the Player Form so we know what's callable
+          try {
+            var plKeys = Object.keys(pl);
+            writeBootLine('api-shape Player (' + plKeys.length + ' keys): ' +
+              plKeys.slice(0, 60).join(','));
+          } catch (_) {}
+          try {
+            var cell = pl.getParentCell();
+            if (cell) {
+              var cellId = '?';
+              try {
+                if (cell.getFormEditorID) cellId = 'editorID=' + cell.getFormEditorID();
+                else if (cell.getName) cellId = 'name=' + cell.getName();
+                else if (cell.getFormID) cellId = 'formID=0x' + cell.getFormID().toString(16);
+              } catch (e) { cellId = '(all name/id calls threw: ' + (e && e.message) + ')'; }
+              writeBootLine('api-shape player.getParentCell() -> OK (' + cellId + ')');
+              try {
+                var cellKeys = Object.keys(cell);
+                writeBootLine('api-shape Cell (' + cellKeys.length + ' keys): ' +
+                  cellKeys.slice(0, 40).join(','));
+              } catch (_) {}
+            } else {
+              writeBootLine('api-shape player.getParentCell() -> null');
+            }
+          } catch (e) {
+            writeBootLine('api-shape player.getParentCell() threw: ' + (e && e.message));
+          }
+        } else {
+          writeBootLine('api-shape sp.Game.getPlayer() returned null');
+        }
+      } catch (e) {
+        writeBootLine('api-shape sp.Game.getPlayer() threw: ' + (e && e.message));
+      }
+    } catch (e) {
+      writeBootLine('api-shape dump failed entirely: ' + (e && e.message));
+    }
+    apiDumpDone = true;
+  }
 
   // ----- Snapshot helpers -------------------------------------------------
   var snapshotsTaken          = 0;
@@ -404,7 +750,17 @@
 
   try {
     sp.on('update', function () {
+      // Bracket the callback with high-resolution timing so we know exactly
+      // how much of each frame we consume. performance.now() is a Node
+      // built-in and returns fractional milliseconds.
+      var cbStart = (typeof performance !== 'undefined' && performance.now)
+        ? performance.now() : Date.now();
       var now = Date.now();
+      // First-tick side-effect: dump API shape from game thread now that
+      // Papyrus natives are callable.
+      if (!apiDumpDone) {
+        try { dumpApiShape(); } catch (_) { apiDumpDone = true; }
+      }
       // Frame-gap measurement: distance from previous "update" fires.
       if (frameLastAt !== 0) {
         var gap = now - frameLastAt;
@@ -423,6 +779,12 @@
         lastGcAt = now;
         try { if (typeof global !== 'undefined' && global.gc) global.gc(); } catch (_) {}
       }
+
+      // Record our own callback duration. Skip the sampling-tick frame
+      // (its sample() runs file I/O and is not representative).
+      var cbEnd = (typeof performance !== 'undefined' && performance.now)
+        ? performance.now() : Date.now();
+      recordOurJsTime(cbEnd - cbStart);
     });
     writeBootLine('on("update") handler registered');
     writeBootLine('heartbeat path: ' + HEARTBEAT_PATH);
