@@ -595,8 +595,13 @@ static LONG CALLBACK TextureQueueExceptionHandler(EXCEPTION_POINTERS* a_ex) {
 // found within a reasonable scan depth, fall back to skipping the compare
 // and forcing ZF=1 so the immediate caller takes the "null field" path.
 
-static constexpr uintptr_t kMovementJobCrashOffset = 0x0783642;
-static constexpr uint32_t  kMovementJobCrashInsnLen = 8;
+static constexpr uintptr_t kMovementJobCrashOffsetA = 0x0783642;
+static constexpr uint32_t  kMovementJobCrashInsnLenA = 8;
+// New 2026-07-11 variant from CrashLogger:
+//   SkyrimSE.exe+0x0CF672C : add rcx, [rdi] with RDI=0
+// Same job-thread movement-controller race as site A, different basic block.
+static constexpr uintptr_t kMovementJobCrashOffsetB = 0x0CF672C;
+static constexpr uint32_t  kMovementJobCrashInsnLenB = 3;
 
 // The BSJobs::JobThread work-item dispatcher lives in this range. Frames
 // here are the ones we want to unwind to: the dispatcher treats a returning
@@ -619,9 +624,27 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
 
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
-    if (ctx->Rip != g_baseAddr + kMovementJobCrashOffset)
-        return EXCEPTION_CONTINUE_SEARCH;
-    if (ctx->Rcx != 0)
+
+    // Accept two known movement-job crash sites with strict null-register
+    // checks to avoid swallowing unrelated AVs in nearby code.
+    bool matchedSite = false;
+    uint32_t matchedInsnLen = 0;
+
+    if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetA) {
+        // Site A: cmp qword ptr [rcx+0x1F8], 0 with RCX=0.
+        if (ctx->Rcx != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenA;
+    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetB) {
+        // Site B: add rcx, [rdi] with RDI=0.
+        if (ctx->Rdi != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenB;
+    }
+
+    if (!matchedSite)
         return EXCEPTION_CONTINUE_SEARCH;
 
     // Scan the stack for a JobThread dispatcher return address. Depth 384
@@ -650,7 +673,7 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     // Fallback: skip the compare and pretend [rcx+0x1F8] was 0.
     // The compare instruction is `cmp qword ptr [rcx+0x1F8], 0`; if we set
     // ZF=1 the caller sees "field is null" and typically returns cleanly.
-    ctx->Rip    += kMovementJobCrashInsnLen;
+    ctx->Rip    += matchedInsnLen;
     ctx->EFlags |= 0x40u;  // set ZF
     ctx->Rax     = 0;
     return AbsorbAndReturn(kHS_MovementJob);
