@@ -105,6 +105,7 @@
 // applied value can be verified in-game.
 
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -1394,6 +1395,73 @@ static HANDLE               g_mainThreadHandle   = nullptr; // set at load time
 // to NOT be considered stalled. 50 ms in a 2-s poll window = 2.5% CPU min.
 static constexpr ULONGLONG  kCpuStallMinAdvance100ns = 500000ULL;
 
+// ----- Deadlock recovery (Detector C extension) ---------------------------
+//
+// Before the watchdog fires its configured action on a CPU stall, it can
+// attempt to break the deadlock by sending an alert to every thread in the
+// process via NtAlertThreadByThreadId.
+//
+// Rationale: dump analysis of all 2026-07-12/15 freeze episodes shows that
+// every SP worker thread is stuck in NtWaitForAlertByThreadId (the kernel
+// primitive behind WaitOnAddress). This is consistent with a "lost wakeup"
+// race: the game thread queued work, called WakeByAddressAll, but the SP
+// workers entered WaitOnAddress AFTER that signal and are now permanently
+// suspended. Calling NtAlertThreadByThreadId on them causes an immediate
+// resample of the condition variable; if the task flag was already set, the
+// workers pick up the queued work and the game resumes without a kill.
+//
+// If recovery succeeds (main-thread CPU advances again within the grace
+// period): log the event, reset stall counter, keep playing.
+// If recovery fails: proceed with the configured Action (dumpAndKill etc.)
+// exactly as before.
+//
+// RecoveryAttempt = 0 disables this (always go straight to Action).
+// Default: 1 (attempt recovery first).
+static bool                 g_recoveryAttempt    = true;
+static DWORD                g_recoveryGraceSec   = 5;
+
+// NTSTATUS return type for ntdll functions (avoid pulling in ntdef.h)
+typedef LONG SP_NTSTATUS2;
+using NtAlertThreadByThreadIdFn = SP_NTSTATUS2 (NTAPI*)(ULONG_PTR ThreadId);
+
+// Alert every thread in this process (except the calling thread).
+// Only threads blocked in NtWaitForAlertByThreadId are affected; all
+// other threads simply get a pending-alert bit set (harmless, cleared on
+// the next alertable wait entry).
+// Returns the number of threads that were alerted.
+static int AlertAllProcessThreads() {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return 0;
+
+    auto pAlert = reinterpret_cast<NtAlertThreadByThreadIdFn>(
+        GetProcAddress(ntdll, "NtAlertThreadByThreadId"));
+    if (!pAlert) {
+        Log("[watchdog] recovery: NtAlertThreadByThreadId unavailable "
+            "(requires Windows 8+)");
+        return 0;
+    }
+
+    DWORD myTid = GetCurrentThreadId();
+    DWORD myPid = GetCurrentProcessId();
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+
+    int count = 0;
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    if (Thread32First(hSnap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != myPid) continue;
+            if (te.th32ThreadID == myTid)       continue;
+            pAlert(static_cast<ULONG_PTR>(te.th32ThreadID));
+            ++count;
+        } while (Thread32Next(hSnap, &te));
+    }
+    CloseHandle(hSnap);
+    return count;
+}
+
 // EnumWindows callback: pick the first top-level, visible, non-owned window
 // belonging to our own process. That's the game's main render window.
 static BOOL CALLBACK HangWatchdog_FindWindowProc(HWND hwnd, LPARAM /*lp*/) {
@@ -1641,10 +1709,11 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
                 u.HighPart = ftUser.dwHighDateTime;
                 ULONGLONG total = k.QuadPart + u.QuadPart;
 
-                static ULONGLONG s_lastCpuTotal    = 0;
-                static bool      s_lastCpuValid    = false;
-                static DWORD     s_cpuStallTicks   = 0;
+                static ULONGLONG s_lastCpuTotal      = 0;
+                static bool      s_lastCpuValid      = false;
+                static DWORD     s_cpuStallTicks     = 0;
                 static bool      s_triggeredCpuStall = false;
+                static bool      s_recoveryDone      = false; // one attempt per episode
 
                 if (!s_lastCpuValid) {
                     // First sample -- wait until after initial loading
@@ -1659,14 +1728,87 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
                     if (delta < kCpuStallMinAdvance100ns) {
                         ++s_cpuStallTicks;
                         const DWORD stallSec = (s_cpuStallTicks * kPollMs) / 1000;
+
+                        // --- Recovery attempt (before final action) ---
+                        // Only try once per stall episode, and only when the
+                        // threshold is first crossed.
+                        if (stallSec >= g_cpuStallSec &&
+                            !s_triggeredCpuStall &&
+                            g_recoveryAttempt &&
+                            !s_recoveryDone) {
+
+                            s_recoveryDone = true;
+                            Log("[watchdog] CPU stall for %us -- attempting "
+                                "deadlock recovery (alert all process threads)",
+                                stallSec);
+                            int alerted = AlertAllProcessThreads();
+                            Log("[watchdog] recovery: alerted %d threads; "
+                                "waiting %us for game to resume...",
+                                alerted, g_recoveryGraceSec);
+
+                            // Sleep the grace period then resample.
+                            // (Watchdog is a background thread -- brief sleep
+                            // is fine; other detectors simply skip this one
+                            // cycle.)
+                            Sleep(g_recoveryGraceSec * 1000u);
+
+                            FILETIME ftC2, ftE2, ftK2, ftU2;
+                            if (GetThreadTimes(g_mainThreadHandle, &ftC2,
+                                               &ftE2, &ftK2, &ftU2)) {
+                                ULARGE_INTEGER k2, u2;
+                                k2.LowPart  = ftK2.dwLowDateTime;
+                                k2.HighPart = ftK2.dwHighDateTime;
+                                u2.LowPart  = ftU2.dwLowDateTime;
+                                u2.HighPart = ftU2.dwHighDateTime;
+                                ULONGLONG total2 = k2.QuadPart + u2.QuadPart;
+                                ULONGLONG advance = total2 - total;
+
+                                // Update baseline so the next poll cycle
+                                // doesn't double-count the grace period time.
+                                s_lastCpuTotal = total2;
+
+                                // Consider recovered if main thread advanced
+                                // by at least kCpuStallMinAdvance100ns per
+                                // poll-interval equivalent of the grace period.
+                                const ULONGLONG kRecoverMin =
+                                    kCpuStallMinAdvance100ns *
+                                    (g_recoveryGraceSec * 1000ULL / kPollMs);
+
+                                if (advance >= kRecoverMin) {
+                                    Log("[watchdog] recovery SUCCEEDED: "
+                                        "main-thread CPU advanced %llums in "
+                                        "%us grace period -- deadlock broken, "
+                                        "resuming normal monitoring.",
+                                        (unsigned long long)(advance / 10000),
+                                        g_recoveryGraceSec);
+                                    // Reset stall state; don't take action.
+                                    s_cpuStallTicks     = 0;
+                                    s_triggeredCpuStall = false;
+                                    s_recoveryDone      = false;
+                                    goto detectorC_end;
+                                } else {
+                                    Log("[watchdog] recovery FAILED: CPU "
+                                        "advanced only %llums in %us (need "
+                                        ">%llums) -- proceeding with action.",
+                                        (unsigned long long)(advance / 10000),
+                                        g_recoveryGraceSec,
+                                        (unsigned long long)(kRecoverMin / 10000));
+                                }
+                            }
+                        }
+
+                        // --- Final action ---
                         if (stallSec >= g_cpuStallSec && !s_triggeredCpuStall) {
                             s_triggeredCpuStall = true;
-                            char reason[128];
+                            char reason[192];
                             std::snprintf(reason, sizeof(reason),
                                           "main-thread CPU stall for %us "
-                                          "(delta=%llums)",
+                                          "(delta=%llums)%s",
                                           stallSec,
-                                          (unsigned long long)(delta / 10000));
+                                          (unsigned long long)(delta / 10000),
+                                          s_recoveryDone
+                                            ? " [recovery attempted, failed]"
+                                            : "");
                             HangWatchdog_TakeAction(reason);
                         }
                     } else {
@@ -1677,10 +1819,12 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
                                 (s_cpuStallTicks * kPollMs) / 1000,
                                 (unsigned long long)(delta / 10000));
                         }
-                        s_cpuStallTicks    = 0;
+                        s_cpuStallTicks     = 0;
                         s_triggeredCpuStall = false;
+                        s_recoveryDone      = false;
                     }
                 }
+                detectorC_end:;
             }
         }
     }
@@ -1706,10 +1850,15 @@ static void InstallHangWatchdog() {
 
     int cpuStallSec =
         GetPrivateProfileIntA("HangWatchdog", "CpuStallSec", 30, g_iniPath);
+    int recoveryAttempt =
+        GetPrivateProfileIntA("HangWatchdog", "RecoveryAttempt", 1, g_iniPath);
+    int recoveryGraceSec =
+        GetPrivateProfileIntA("HangWatchdog", "RecoveryGraceSec", 5, g_iniPath);
 
     Log("[watchdog] Enabled=%d ThresholdSec=%d HeartbeatStaleSec=%d "
-        "CpuStallSec=%d Action=%s",
-        (int)g_hangEnabled, thresholdSec, heartbeatSec, cpuStallSec, actionStr);
+        "CpuStallSec=%d RecoveryAttempt=%d RecoveryGraceSec=%d Action=%s",
+        (int)g_hangEnabled, thresholdSec, heartbeatSec, cpuStallSec,
+        recoveryAttempt, recoveryGraceSec, actionStr);
 
     if (!g_hangEnabled) {
         Log("[watchdog] disabled by config.");
@@ -1728,6 +1877,11 @@ static void InstallHangWatchdog() {
     if (cpuStallSec < 0)    cpuStallSec = 0;
     if (cpuStallSec > 3600) cpuStallSec = 3600;
     g_cpuStallSec = (DWORD)cpuStallSec;
+
+    g_recoveryAttempt = (recoveryAttempt != 0);
+    if (recoveryGraceSec < 1)  recoveryGraceSec = 1;
+    if (recoveryGraceSec > 60) recoveryGraceSec = 60;
+    g_recoveryGraceSec = (DWORD)recoveryGraceSec;
 
     // Compute the heartbeat file path. memprofile.js writes it to
     // <SkyrimDir>\Data\Platform\SkyMPFixes.heartbeat; we're at
