@@ -35,6 +35,8 @@
 //    root cause as fix 1, different subsystem.
 //    Crash site: SkyrimSE.exe+0783642
 //    cmp qword ptr [rcx+0x1F8], 0x00 with rcx=0.
+//    Also covers water-collision variant at SkyrimSE.exe+051E253
+//    cmp qword ptr [rcx+0x10], 0x00 with a stale/sentinel rcx value.
 //
 // 8. JobThread memcpy Crash Fix (idle animation variant of fixes 1/7)
 //    Prevents CTD when a BSJobs::JobThread work item dispatches an idle
@@ -602,6 +604,11 @@ static constexpr uint32_t  kMovementJobCrashInsnLenA = 8;
 // Same job-thread movement-controller race as site A, different basic block.
 static constexpr uintptr_t kMovementJobCrashOffsetB = 0x0CF672C;
 static constexpr uint32_t  kMovementJobCrashInsnLenB = 3;
+// New 2026-07-15 variant from CrashLogger:
+//   SkyrimSE.exe+0x051E253 : cmp qword ptr [rcx+0x10], 0
+// Same stale-object race family (observed with BGSWaterCollisionManager path).
+static constexpr uintptr_t kMovementJobCrashOffsetC = 0x051E253;
+static constexpr uint32_t  kMovementJobCrashInsnLenC = 5;
 
 // The BSJobs::JobThread work-item dispatcher lives in this range. Frames
 // here are the ones we want to unwind to: the dispatcher treats a returning
@@ -642,6 +649,17 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenB;
+    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetC) {
+        // Site C: cmp qword ptr [rcx+0x10], 0. The observed crash carries
+        // a stale/sentinel RCX; verify the AV fault address matches [rcx+0x10]
+        // so we don't swallow unrelated faults at the same RIP.
+        if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const uintptr_t expectedFault = ctx->Rcx + 0x10;
+        if (static_cast<uintptr_t>(rec->ExceptionInformation[1]) != expectedFault)
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenC;
     }
 
     if (!matchedSite)
@@ -670,9 +688,8 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         return AbsorbAndReturn(kHS_MovementJob);
     }
 
-    // Fallback: skip the compare and pretend [rcx+0x1F8] was 0.
-    // The compare instruction is `cmp qword ptr [rcx+0x1F8], 0`; if we set
-    // ZF=1 the caller sees "field is null" and typically returns cleanly.
+    // Fallback: skip the faulting instruction and bias flags toward the
+    // caller's "null/missing field" path. For cmp sites this means ZF=1.
     ctx->Rip    += matchedInsnLen;
     ctx->EFlags |= 0x40u;  // set ZF
     ctx->Rax     = 0;
