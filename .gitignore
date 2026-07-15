@@ -6,3 +6,5 @@ build/
 memprofile.csv
 memprofile.boot.log
 memprofile-*.log
+
+SkyMPFixes.zip
