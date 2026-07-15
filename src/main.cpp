@@ -1,4 +1,4 @@
-﻿// SkyMP Fixes - Combined SKSE plugin for Skyrim SE 1.6.1170
+// SkyMP Fixes - Combined SKSE plugin for Skyrim SE 1.6.1170
 //
 // Contains fixes for issues caused by SkyMP client's
 // aggressive actor spawn/delete patterns plus a shutdown-hang fix:
@@ -16,6 +16,9 @@
 //    pointer happens to land inside SkyrimSE.exe at a non-executable
 //    .data/.rdata offset (seen on HairLine face-gen TriShapes, AV says
 //    "Tried to execute memory at ...", ExceptionInformation[0] == 8).
+//    Also covers LOD tree culling null vtable at +0427D6F:
+//    call [rax+0x08] with RAX=0 during Main->Reload Content transition,
+//    context: NiCullingProcess / BSTreeNode / NiCamera (fn 26762).
 //
 // 2. WorldClean Crash Fix
 //    Prevents CTD from NPC deletion race condition during load.
@@ -306,16 +309,21 @@ static DWORD WINAPI DiagStatsThread(LPVOID) {
 //   Known crash sites:
 //     +0429E69  mov byte ptr [rdi+0x1C], 0x01   RDI=0xFFFFFFFF  (fn 26789)
 //     +04328E9  mov rax, [rcx]                  RCX=0           (fn 26988)
+//     +0427D6F  call [rax+0x08]                 RAX=0           (fn 26762)
 //   The second site is reached from the BSJobs::JobThread FaceGen pipeline
 //   (callers: +0CF61DA, +0CF7745, +0CF7888, +0CF7E51) when a queued morph
 //   job runs after the BSFaceGenMorphDataHead's referenced object has been
 //   freed (typical of SkyMP's rapid actor spawn/delete).
+//   The third site (+0427D6F) is in the LOD tree / NiCullingProcess path;
+//   the vtable pointer (RAX) is null because the BSTreeNode owner was freed
+//   during a content reload (Main->Reload Content = true).
 
 static bool IsInFaceGenRange(uintptr_t addr) {
     uintptr_t offset = addr - g_baseAddr;
-    // Covers both the original Variant B site (~+0x429xxx) and the newer
-    // job-thread FaceGen helper around +0x4328E9 / +0x04334F8.
-    return offset >= 0x428000 && offset <= 0x434000;
+    // Covers the direct Variant B sites and the FaceGen job-thread helpers.
+    // Lower bound widened 2026-07-15 from 0x428000 to 0x427000 to include
+    // the LOD-tree culling null-vtable site at +0x0427D6F (fn 26762).
+    return offset >= 0x427000 && offset <= 0x434000;
 }
 
 // Direct crash sites for Variant B (valid RIP, bad register).
@@ -323,6 +331,7 @@ static bool IsInFaceGenRange(uintptr_t addr) {
 enum FaceGenBadRegKind : uint8_t {
     kFGBadReg_RDI_FFFFFFFF = 0,  // RDI == 0xFFFFFFFF
     kFGBadReg_RCX_Null     = 1,  // RCX == 0
+    kFGBadReg_RAX_Null     = 2,  // RAX == 0 (null vtable pointer, call [rax+N])
 };
 
 struct FaceGenDirectSite {
@@ -332,8 +341,9 @@ struct FaceGenDirectSite {
 };
 
 static constexpr FaceGenDirectSite kFaceGenDirectSites[] = {
-    { 0x0429E69, 4, kFGBadReg_RDI_FFFFFFFF }, // C6 47 1C 01           â€” mov byte [rdi+0x1C], 1
-    { 0x04328E9, 3, kFGBadReg_RCX_Null     }, // 48 8B 01              â€” mov rax, [rcx]
+    { 0x0429E69, 4, kFGBadReg_RDI_FFFFFFFF }, // C6 47 1C 01  - mov byte [rdi+0x1C], 1
+    { 0x04328E9, 3, kFGBadReg_RCX_Null     }, // 48 8B 01     - mov rax, [rcx]
+    { 0x0427D6F, 3, kFGBadReg_RAX_Null     }, // FF 50 08     - call [rax+0x08], LOD tree culling null vtable
 };
 
 static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
@@ -355,6 +365,7 @@ static LONG CALLBACK FaceGenExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         switch (site.badReg) {
             case kFGBadReg_RDI_FFFFFFFF: matches = (ctx->Rdi == 0xFFFFFFFFu); break;
             case kFGBadReg_RCX_Null:     matches = (ctx->Rcx == 0);            break;
+            case kFGBadReg_RAX_Null:     matches = (ctx->Rax == 0);            break;
         }
         if (!matches)
             return EXCEPTION_CONTINUE_SEARCH;
