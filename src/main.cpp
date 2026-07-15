@@ -88,11 +88,17 @@
 //    freezes where the window still pumps messages but the game logic
 //    is stuck (the typical SkyrimPlatform hook deadlock, which never
 //    trips IsHungAppWindow).
+//    Also includes a third detector (CpuStallSec) that monitors the main
+//    thread's CPU time via GetThreadTimes -- catches the same SP deadlock
+//    without requiring memprofile.js. Confirmed effective against the
+//    NtWaitForAlertByThreadId freeze pattern seen in all 2026-07-12 and
+//    2026-07-15 hang dumps.
 //    Configured via SkyMPFixes.ini:
 //        [HangWatchdog]
 //        Enabled = 1
 //        HangThresholdSec  = 30   ; window pump stuck for this long
 //        HeartbeatStaleSec = 10   ; game-loop heartbeat stale for this long
+//        CpuStallSec       = 30   ; main-thread zero-CPU for this long
 //        Action = dumpAndKill   ; one of: log, dump, kill, dumpAndKill
 //
 // All steps are logged to SkyMPFixes.log next to the DLL so the actual
@@ -1361,6 +1367,33 @@ static bool                 g_heartbeatSeen      = false;   // true once we've
 static ULONGLONG            g_watchdogStartFt    = 0;       // FILETIME ticks
                                                             // at watchdog init
 
+// ----- Detector C: main-thread CPU-time stall (heartbeat-free fallback) ---
+//
+// Captures the main-thread handle at SKSEPlugin_Load time (when the DLL is
+// called from the main thread). Polls GetThreadTimes every watchdog tick.
+// If the main thread's total CPU time (user + kernel) does not advance by at
+// least kCpuStallMinAdvance100ns per tick over CpuStallSec consecutive
+// seconds, we treat the game loop as stuck.
+//
+// This reliably catches the SkyrimPlatform JS-thread-pool deadlock observed
+// in every hang dump (2026-07-12 / 2026-07-15): in that scenario the main
+// thread sits in NtWaitForAlertByThreadId with no CPU consumption while all
+// SP worker threads are blocked on a contended lock. IsHungAppWindow returns
+// FALSE (the window still pumps messages) and no heartbeat file exists, so
+// the two existing detectors are both blind. CPU time, however, drops to ~0
+// immediately and stays there for the entire freeze.
+//
+// Minimum advance is intentionally generous (50 ms per 5 s window = 1% CPU)
+// so loading screens, background idle, and very low-FPS scenes don't false-
+// positive. A real freeze always reads 0 CPU for dozens of consecutive ticks.
+//
+// CpuStallSec = 0 disables this detector. Default: 30 (conservative).
+static DWORD                g_cpuStallSec        = 30;      // 0 disables
+static HANDLE               g_mainThreadHandle   = nullptr; // set at load time
+// 100-ns ticks: 500,000 = 50 ms. Must advance by this much per poll interval
+// to NOT be considered stalled. 50 ms in a 2-s poll window = 2.5% CPU min.
+static constexpr ULONGLONG  kCpuStallMinAdvance100ns = 500000ULL;
+
 // EnumWindows callback: pick the first top-level, visible, non-owned window
 // belonging to our own process. That's the game's main render window.
 static BOOL CALLBACK HangWatchdog_FindWindowProc(HWND hwnd, LPARAM /*lp*/) {
@@ -1592,6 +1625,64 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
                 triggeredHeartbeatAction = false;
             }
         }
+
+        // --- Detector C: main-thread CPU-time stall (heartbeat-free) ---
+        // Catches the SkyrimPlatform JS-pool deadlock where the main game
+        // thread sits in NtWaitForAlertByThreadId consuming zero CPU time
+        // while the window still responds to WM_NULL (IsHungAppWindow=FALSE).
+        if (g_cpuStallSec > 0 && g_mainThreadHandle) {
+            FILETIME ftCreate, ftExit, ftKernel, ftUser;
+            if (GetThreadTimes(g_mainThreadHandle,
+                               &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+                ULARGE_INTEGER k, u;
+                k.LowPart  = ftKernel.dwLowDateTime;
+                k.HighPart = ftKernel.dwHighDateTime;
+                u.LowPart  = ftUser.dwLowDateTime;
+                u.HighPart = ftUser.dwHighDateTime;
+                ULONGLONG total = k.QuadPart + u.QuadPart;
+
+                static ULONGLONG s_lastCpuTotal    = 0;
+                static bool      s_lastCpuValid    = false;
+                static DWORD     s_cpuStallTicks   = 0;
+                static bool      s_triggeredCpuStall = false;
+
+                if (!s_lastCpuValid) {
+                    // First sample -- wait until after initial loading
+                    // before we start watching (SKSE calls us post-DataLoaded,
+                    // but the main thread can be idle very early during init).
+                    s_lastCpuTotal = total;
+                    s_lastCpuValid = true;
+                } else {
+                    ULONGLONG delta = total - s_lastCpuTotal;
+                    s_lastCpuTotal  = total;
+
+                    if (delta < kCpuStallMinAdvance100ns) {
+                        ++s_cpuStallTicks;
+                        const DWORD stallSec = (s_cpuStallTicks * kPollMs) / 1000;
+                        if (stallSec >= g_cpuStallSec && !s_triggeredCpuStall) {
+                            s_triggeredCpuStall = true;
+                            char reason[128];
+                            std::snprintf(reason, sizeof(reason),
+                                          "main-thread CPU stall for %us "
+                                          "(delta=%llums)",
+                                          stallSec,
+                                          (unsigned long long)(delta / 10000));
+                            HangWatchdog_TakeAction(reason);
+                        }
+                    } else {
+                        // Main thread is consuming CPU -- reset stall counter.
+                        if (s_cpuStallTicks > 0) {
+                            Log("[watchdog] main-thread CPU resumed after "
+                                "%us stall (delta=%llums)",
+                                (s_cpuStallTicks * kPollMs) / 1000,
+                                (unsigned long long)(delta / 10000));
+                        }
+                        s_cpuStallTicks    = 0;
+                        s_triggeredCpuStall = false;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1613,8 +1704,12 @@ static void InstallHangWatchdog() {
     else if (_stricmp(actionStr, "dumpAndKill") == 0)  g_hangAction = kHangAction_DumpAndKill;
     else                                                g_hangAction = kHangAction_DumpAndKill;
 
-    Log("[watchdog] Enabled=%d ThresholdSec=%d HeartbeatStaleSec=%d Action=%s",
-        (int)g_hangEnabled, thresholdSec, heartbeatSec, actionStr);
+    int cpuStallSec =
+        GetPrivateProfileIntA("HangWatchdog", "CpuStallSec", 30, g_iniPath);
+
+    Log("[watchdog] Enabled=%d ThresholdSec=%d HeartbeatStaleSec=%d "
+        "CpuStallSec=%d Action=%s",
+        (int)g_hangEnabled, thresholdSec, heartbeatSec, cpuStallSec, actionStr);
 
     if (!g_hangEnabled) {
         Log("[watchdog] disabled by config.");
@@ -1629,6 +1724,10 @@ static void InstallHangWatchdog() {
     if (heartbeatSec < 0)    heartbeatSec = 0;
     if (heartbeatSec > 3600) heartbeatSec = 3600;
     g_heartbeatStaleSec = (DWORD)heartbeatSec;
+
+    if (cpuStallSec < 0)    cpuStallSec = 0;
+    if (cpuStallSec > 3600) cpuStallSec = 3600;
+    g_cpuStallSec = (DWORD)cpuStallSec;
 
     // Compute the heartbeat file path. memprofile.js writes it to
     // <SkyrimDir>\Data\Platform\SkyMPFixes.heartbeat; we're at
@@ -1726,6 +1825,15 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     Log("[boot] SkyMPFixes loaded. skse=%u runtime=%u editor=%u",
         a_skse->skseVersion, a_skse->runtimeVersion, a_skse->isEditor);
     Log("[boot] DLL dir: %s", g_dllDir[0] ? g_dllDir : "(unresolved)");
+
+    // Capture main-thread handle for Detector C (CPU-time stall).
+    // SKSEPlugin_Load is called on the game's main thread, so current thread
+    // IS the main thread. THREAD_QUERY_INFORMATION is all we need.
+    g_mainThreadHandle = OpenThread(THREAD_QUERY_INFORMATION, FALSE,
+                                    GetCurrentThreadId());
+    if (!g_mainThreadHandle)
+        Log("[watchdog] OpenThread for main-thread handle failed (gle=%u) -- "
+            "Detector C disabled.", GetLastError());
 
     // Register all exception handlers (priority 1 = called first)
     AddVectoredExceptionHandler(1, FaceGenExceptionHandler);
