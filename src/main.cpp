@@ -627,6 +627,11 @@ static constexpr uint32_t  kMovementJobCrashInsnLenB = 3;
 // Same stale-object race family (observed with BGSWaterCollisionManager path).
 static constexpr uintptr_t kMovementJobCrashOffsetC = 0x051E253;
 static constexpr uint32_t  kMovementJobCrashInsnLenC = 5;
+// New 2026-07-16 variant from CrashLogger:
+//   SkyrimSE.exe+0x0CF7895 : mov rax, [rdi+0x18] with RDI=0
+// Same movement-controller job-thread stale-object race family.
+static constexpr uintptr_t kMovementJobCrashOffsetD = 0x0CF7895;
+static constexpr uint32_t  kMovementJobCrashInsnLenD = 4;
 
 // The BSJobs::JobThread work-item dispatcher lives in this range. Frames
 // here are the ones we want to unwind to: the dispatcher treats a returning
@@ -678,6 +683,12 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenC;
+    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetD) {
+        // Site D: mov rax, [rdi+0x18] with RDI=0.
+        if (ctx->Rdi != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenD;
     }
 
     if (!matchedSite)
