@@ -638,6 +638,11 @@ static constexpr uint32_t  kMovementJobCrashInsnLenD = 4;
 // Same movement-controller/water-collision stale-object race family.
 static constexpr uintptr_t kMovementJobCrashOffsetE = 0x0CF78A7;
 static constexpr uint32_t  kMovementJobCrashInsnLenE = 5;
+// New 2026-07-21 variant from CrashLogger:
+//   SkyrimSE.exe+0x0CF813E : mov r11d, [r14+0xA6C] with R14=0
+// Same movement-controller/water-collision stale-object race family.
+static constexpr uintptr_t kMovementJobCrashOffsetF = 0x0CF813E;
+static constexpr uint32_t  kMovementJobCrashInsnLenF = 7;
 
 // The BSJobs::JobThread work-item dispatcher lives in this range. Frames
 // here are the ones we want to unwind to: the dispatcher treats a returning
@@ -706,6 +711,16 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenE;
+    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetF) {
+        // Site F: mov r11d, [r14+0xA6C]. Match null-base read at [r14+0xA6C].
+        if (ctx->R14 != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (static_cast<uintptr_t>(rec->ExceptionInformation[1]) != (ctx->R14 + 0xA6C))
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenF;
     }
 
     if (!matchedSite)
