@@ -236,12 +236,13 @@ enum HandlerSlot {
     kHS_TextureQueue    = 2,
     kHS_MovementJob     = 3,
     kHS_JobMemcpy       = 4,
+    kHS_MountCamera     = 5,
     kHS_Count
 };
 
 static const char* const kHandlerNames[kHS_Count] = {
     "FaceGen", "WorldClean", "TextureQueue", "MovementJob",
-    "JobMemcpy"
+    "JobMemcpy", "MountCamera"
 };
 
 static volatile LONG g_handlerFires[kHS_Count]      = {0};
@@ -702,7 +703,12 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     uintptr_t safeRsp = 0;
 
     for (int j = 0; j < 384; ++j) {
-        uintptr_t val = stack[j];
+        uintptr_t val = 0;
+        __try {
+            val = stack[j];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
         if (IsInJobThreadDispatcher(val, g_baseAddr, g_moduleEnd)) {
             safeReturn = val;
             safeRsp = ctx->Rsp + (j + 1) * 8;
@@ -817,6 +823,50 @@ static LONG CALLBACK JobMemcpyExceptionHandler(EXCEPTION_POINTERS* a_ex) {
 
     // Couldn't find a safe frame to return to -- let the crash proceed
     // so CrashLoggerSSE captures it and we get more info.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 9: Mount/Camera Interaction Null-Deref
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Crash signature (repro: horse + Whiterun main gate interaction):
+//   SkyrimSE.exe+0x07108F0 : mov rax, [rcx+0x08]
+//   RCX=0, AV read at 0x8.
+//
+// This guard is intentionally narrow and always-on:
+//   1) Exact RIP match
+//   2) RCX must be null
+//   3) AV must be a READ at the exact computed address [rcx+0x8]
+//
+// Recovery is an early-return unwind (NOT in-function resume): resuming from
+// the next instruction left camera/interaction state inconsistent in live
+// testing. We instead return directly to the caller with a null result.
+static constexpr uintptr_t kMountCameraCrashOffset = 0x07108F0;
+
+static LONG CALLBACK MountCameraExceptionHandler(EXCEPTION_POINTERS* a_ex) {
+    const auto* rec = a_ex->ExceptionRecord;
+    auto*       ctx = a_ex->ContextRecord;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (ctx->Rip != g_baseAddr + kMountCameraCrashOffset)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (ctx->Rcx != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    const uintptr_t expectedFault = ctx->Rcx + 0x8;
+    if (static_cast<uintptr_t>(rec->ExceptionInformation[1]) != expectedFault)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Site confirmed unsafe to recover externally: both in-function resume
+    // and caller-unwind caused severe camera/world desync in live gameplay.
+    // Let CrashLogger handle this one until we can mirror native semantics.
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
