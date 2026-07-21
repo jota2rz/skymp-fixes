@@ -659,6 +659,16 @@ static bool IsInJobThreadDispatcher(uintptr_t addr, uintptr_t baseAddr,
     return off >= 0x00CF6000 && off <= 0x00CF9000;
 }
 
+// Water-collision movement path where execute-null variants have been seen
+// (stack frames around +0x051Dxxx..+0x051Fxxx).
+static bool IsInMovementWaterRange(uintptr_t addr, uintptr_t baseAddr,
+                                   uintptr_t moduleEnd) {
+    if (addr < baseAddr || addr >= moduleEnd)
+        return false;
+    const uintptr_t off = addr - baseAddr;
+    return off >= 0x0051D000 && off <= 0x00521000;
+}
+
 static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     const auto* rec = a_ex->ExceptionRecord;
     auto*       ctx = a_ex->ContextRecord;
@@ -672,20 +682,51 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     uint32_t matchedInsnLen = 0;
     bool matchedCmpSite = false;
 
-    if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetA) {
+    // Variant G: execute AV at RIP=0 with the same movement/water stack
+    // shape. No safe instruction skip exists at RIP=0; only dispatcher
+    // unwind is allowed.
+    if (ctx->Rip == 0) {
+        if (rec->NumberParameters >= 2 &&
+            rec->ExceptionInformation[0] == 8 &&
+            static_cast<uintptr_t>(rec->ExceptionInformation[1]) == 0) {
+            uintptr_t* stack = reinterpret_cast<uintptr_t*>(ctx->Rsp);
+            bool sawWaterRange = false;
+            bool sawDispatcher = false;
+            for (int j = 0; j < 96; ++j) {
+                uintptr_t val = 0;
+                __try {
+                    val = stack[j];
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    break;
+                }
+                if (!sawWaterRange && IsInMovementWaterRange(val, g_baseAddr, g_moduleEnd))
+                    sawWaterRange = true;
+                if (!sawDispatcher && IsInJobThreadDispatcher(val, g_baseAddr, g_moduleEnd))
+                    sawDispatcher = true;
+                if (sawWaterRange && sawDispatcher)
+                    break;
+            }
+            if (sawWaterRange && sawDispatcher) {
+                matchedSite = true;
+                matchedInsnLen = 0; // dispatcher-unwind only for this variant
+            }
+        }
+    }
+
+    if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetA) {
         // Site A: cmp qword ptr [rcx+0x1F8], 0 with RCX=0.
         if (ctx->Rcx != 0)
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenA;
         matchedCmpSite = true;
-    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetB) {
+    } else if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetB) {
         // Site B: add rcx, [rdi] with RDI=0.
         if (ctx->Rdi != 0)
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenB;
-    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetC) {
+    } else if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetC) {
         // Site C: cmp qword ptr [rcx+0x10], 0. The observed crash carries
         // a stale/sentinel RCX; verify the AV fault address matches [rcx+0x10]
         // so we don't swallow unrelated faults at the same RIP.
@@ -697,13 +738,13 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenC;
         matchedCmpSite = true;
-    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetD) {
+    } else if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetD) {
         // Site D: mov rax, [rdi+0x18] with RDI=0.
         if (ctx->Rdi != 0)
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenD;
-    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetE) {
+    } else if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetE) {
         // Site E: lock xadd [rdx], rax. Match only write AV at [rdx].
         if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 1)
             return EXCEPTION_CONTINUE_SEARCH;
@@ -711,7 +752,7 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenE;
-    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetF) {
+    } else if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetF) {
         // Site F: mov r11d, [r14+0xA6C]. Match null-base read at [r14+0xA6C].
         if (ctx->R14 != 0)
             return EXCEPTION_CONTINUE_SEARCH;
@@ -753,6 +794,9 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         ctx->Rax = 0;
         return AbsorbAndReturn(kHS_MovementJob);
     }
+
+    if (matchedInsnLen == 0)
+        return EXCEPTION_CONTINUE_SEARCH;
 
     // Fallback: skip the faulting instruction. Only cmp sites get ZF=1 to
     // bias callers toward "null/missing field" branches.
