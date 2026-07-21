@@ -106,6 +106,7 @@
 
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -1473,7 +1474,7 @@ static void InstallV8HeapLimitFix() {
 // we take the configured Action:
 //
 //   log         -- just note it in SkyMPFixes.log
-//   dump        -- write a full-memory mini-dump next to SkyMPFixes.log
+//   dump        -- write a mini-dump next to SkyMPFixes.log
 //   kill        -- TerminateProcess on ourselves (immediate exit)
 //   dumpAndKill -- dump first, then kill
 //
@@ -1481,6 +1482,9 @@ static void InstallV8HeapLimitFix() {
 // combination captures a mini-dump for later analysis and then ends the
 // frozen session so the user can restart the game. Change Action=dump if
 // you'd rather keep the hung process running and decide when to close it.
+//
+// Dump size defaults to "small" for routine crash triage and disk hygiene.
+// Set [HangWatchdog] FullMemoryDump=1 when deep heap forensics are needed.
 
 using SP_IsHungAppWindowFn = BOOL (WINAPI*)(HWND);
 
@@ -1494,6 +1498,7 @@ enum HangAction {
 static bool                 g_hangEnabled        = true;
 static DWORD                g_hangThresholdSec   = 30;
 static HangAction           g_hangAction         = kHangAction_DumpAndKill;
+static bool                 g_fullMemoryDump     = false; // default small dump
 static SP_IsHungAppWindowFn g_pIsHungAppWindow   = nullptr;
 static HWND                 g_gameWindow         = nullptr;
 
@@ -1670,15 +1675,93 @@ static void HangWatchdog_WriteDump() {
         return;
     }
 
-    // Flags: MiniDumpWithFullMemory | WithHandleData | WithUnloadedModules
-    //      | WithFullMemoryInfo | WithThreadInfo
-    const DWORD kType = 0x00000002 | 0x00000004 | 0x00000020 | 0x00000800
-                      | 0x00001000;
-    Log("[watchdog] writing dump to %s (this can take a while) ...", dumpPath);
+    // Base "small" profile: useful stacks/module state without huge files.
+    DWORD kType = 0x00000000 /* MiniDumpNormal */
+                | 0x00000004 /* MiniDumpWithHandleData */
+                | 0x00000020 /* MiniDumpWithUnloadedModules */
+                | 0x00000800 /* MiniDumpWithFullMemoryInfo */
+                | 0x00001000 /* MiniDumpWithThreadInfo */;
+    if (g_fullMemoryDump) {
+        kType |= 0x00000002; // MiniDumpWithFullMemory
+    }
+
+    Log("[watchdog] writing %s dump to %s (this can take a while) ...",
+        g_fullMemoryDump ? "full-memory" : "small", dumpPath);
     BOOL ok = pWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
                          hFile, kType, nullptr, nullptr, nullptr);
     CloseHandle(hFile);
     Log("[watchdog] dump %s (%s)", ok ? "written" : "FAILED", dumpPath);
+}
+
+struct DumpFileEntry {
+    std::string path;
+    ULONGLONG   lastWriteFt;
+};
+
+// Keep only the newest N .dmp files in the plugin directory.
+// Runs at startup so users upgrading from older versions get trimmed too.
+static void PruneOldDumpFilesInPluginDir(size_t keepNewestCount) {
+    if (!g_dllDir[0]) {
+        Log("[dmp-retention] skipped: DLL directory not resolved.");
+        return;
+    }
+
+    char pattern[MAX_PATH];
+    std::snprintf(pattern, MAX_PATH, "%s\\*.dmp", g_dllDir);
+
+    WIN32_FIND_DATAA fd = {};
+    HANDLE hFind = FindFirstFileA(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        DWORD gle = GetLastError();
+        if (gle != ERROR_FILE_NOT_FOUND)
+            Log("[dmp-retention] FindFirstFileA failed (gle=%lu)", gle);
+        return;
+    }
+
+    std::vector<DumpFileEntry> dumps;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        char fullPath[MAX_PATH];
+        std::snprintf(fullPath, MAX_PATH, "%s\\%s", g_dllDir, fd.cFileName);
+
+        ULARGE_INTEGER ft;
+        ft.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+        ft.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+
+        dumps.push_back(DumpFileEntry{fullPath, ft.QuadPart});
+    } while (FindNextFileA(hFind, &fd));
+
+    FindClose(hFind);
+
+    if (dumps.size() <= keepNewestCount) {
+        if (!dumps.empty()) {
+            Log("[dmp-retention] %zu dump file(s) found, keep=%zu, nothing to delete.",
+                dumps.size(), keepNewestCount);
+        }
+        return;
+    }
+
+    std::sort(dumps.begin(), dumps.end(),
+              [](const DumpFileEntry& a, const DumpFileEntry& b) {
+                  if (a.lastWriteFt != b.lastWriteFt)
+                      return a.lastWriteFt > b.lastWriteFt;
+                  return a.path < b.path;
+              });
+
+    size_t deleted = 0;
+    for (size_t i = keepNewestCount; i < dumps.size(); ++i) {
+        if (DeleteFileA(dumps[i].path.c_str())) {
+            ++deleted;
+        } else {
+            Log("[dmp-retention] failed to delete %s (gle=%lu)",
+                dumps[i].path.c_str(), GetLastError());
+        }
+    }
+
+    Log("[dmp-retention] found=%zu keep=%zu deleted=%zu",
+        dumps.size(), keepNewestCount, deleted);
 }
 
 static const char* HangActionName(HangAction a) {
@@ -2006,11 +2089,15 @@ static void InstallHangWatchdog() {
         GetPrivateProfileIntA("HangWatchdog", "RecoveryAttempt", 1, g_iniPath);
     int recoveryGraceSec =
         GetPrivateProfileIntA("HangWatchdog", "RecoveryGraceSec", 5, g_iniPath);
+    g_fullMemoryDump =
+        (GetPrivateProfileIntA("HangWatchdog", "FullMemoryDump", 0, g_iniPath) != 0);
 
     Log("[watchdog] Enabled=%d ThresholdSec=%d HeartbeatStaleSec=%d "
-        "CpuStallSec=%d RecoveryAttempt=%d RecoveryGraceSec=%d Action=%s",
+        "CpuStallSec=%d RecoveryAttempt=%d RecoveryGraceSec=%d "
+        "Action=%s FullMemoryDump=%d",
         (int)g_hangEnabled, thresholdSec, heartbeatSec, cpuStallSec,
-        recoveryAttempt, recoveryGraceSec, actionStr);
+        recoveryAttempt, recoveryGraceSec, actionStr,
+        (int)g_fullMemoryDump);
 
     if (!g_hangEnabled) {
         Log("[watchdog] disabled by config.");
@@ -2131,6 +2218,9 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     Log("[boot] SkyMPFixes loaded. skse=%u runtime=%u editor=%u",
         a_skse->skseVersion, a_skse->runtimeVersion, a_skse->isEditor);
     Log("[boot] DLL dir: %s", g_dllDir[0] ? g_dllDir : "(unresolved)");
+
+    // Trim stale dumps left by previous sessions/versions.
+    PruneOldDumpFilesInPluginDir(2);
 
     // Capture main-thread handle for Detector C (CPU-time stall).
     // SKSEPlugin_Load is called on the game's main thread, so current thread
