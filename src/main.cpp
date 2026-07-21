@@ -1774,9 +1774,133 @@ static const char* HangActionName(HangAction a) {
     return "?";
 }
 
+static const char* HangWatchdog_DetectorFromReason(const char* reason) {
+    if (!reason) return "unknown";
+    if (std::strstr(reason, "window unresponsive"))
+        return "window-hang";
+    if (std::strstr(reason, "heartbeat stale"))
+        return "heartbeat-stale";
+    if (std::strstr(reason, "CPU stall"))
+        return "cpu-stall";
+    return "unknown";
+}
+
+static bool HangWatchdog_FormatModuleOffset(uintptr_t addr,
+                                            char* out, size_t outSize) {
+    if (!out || outSize == 0) return false;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0)
+        return false;
+    if (!mbi.AllocationBase)
+        return false;
+
+    char modulePath[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameA(reinterpret_cast<HMODULE>(mbi.AllocationBase),
+                                 modulePath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return false;
+
+    const char* baseName = modulePath;
+    for (const char* p = modulePath; *p; ++p) {
+        if (*p == '\\' || *p == '/')
+            baseName = p + 1;
+    }
+
+    uintptr_t base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+    std::snprintf(out, outSize, "%s+0x%llX",
+                  baseName,
+                  (unsigned long long)(addr - base));
+    return true;
+}
+
+// Capture a quick main-thread snapshot right before watchdog action so the
+// log still has useful breadcrumbs even if a dump is partially unreadable.
+static void HangWatchdog_LogMainThreadSnapshot(const char* reason) {
+    const char* detector = HangWatchdog_DetectorFromReason(reason);
+    if (!g_mainThreadHandle) {
+        Log("[watchdog] snapshot: detector=%s reason='%s' mainThreadHandle=<null>",
+            detector, reason ? reason : "");
+        return;
+    }
+
+    DWORD suspendRes = SuspendThread(g_mainThreadHandle);
+    if (suspendRes == static_cast<DWORD>(-1)) {
+        Log("[watchdog] snapshot: detector=%s reason='%s' SuspendThread failed (gle=%u)",
+            detector, reason ? reason : "", GetLastError());
+        return;
+    }
+
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    if (!GetThreadContext(g_mainThreadHandle, &ctx)) {
+        DWORD gle = GetLastError();
+        ResumeThread(g_mainThreadHandle);
+        Log("[watchdog] snapshot: detector=%s reason='%s' GetThreadContext failed (gle=%u)",
+            detector, reason ? reason : "", gle);
+        return;
+    }
+
+    uintptr_t stackQwords[64] = {};
+    SIZE_T bytesRead = 0;
+    bool stackOk = ReadProcessMemory(GetCurrentProcess(),
+                                     reinterpret_cast<LPCVOID>(ctx.Rsp),
+                                     stackQwords,
+                                     sizeof(stackQwords),
+                                     &bytesRead) != 0;
+    DWORD rpmGle = stackOk ? 0 : GetLastError();
+
+    ResumeThread(g_mainThreadHandle);
+
+    char ripText[128] = {0};
+    char rspText[128] = {0};
+    char rbpText[128] = {0};
+    if (!HangWatchdog_FormatModuleOffset(static_cast<uintptr_t>(ctx.Rip),
+                                         ripText, sizeof(ripText))) {
+        std::snprintf(ripText, sizeof(ripText), "0x%llX",
+                      (unsigned long long)ctx.Rip);
+    }
+    if (!HangWatchdog_FormatModuleOffset(static_cast<uintptr_t>(ctx.Rsp),
+                                         rspText, sizeof(rspText))) {
+        std::snprintf(rspText, sizeof(rspText), "0x%llX",
+                      (unsigned long long)ctx.Rsp);
+    }
+    if (!HangWatchdog_FormatModuleOffset(static_cast<uintptr_t>(ctx.Rbp),
+                                         rbpText, sizeof(rbpText))) {
+        std::snprintf(rbpText, sizeof(rbpText), "0x%llX",
+                      (unsigned long long)ctx.Rbp);
+    }
+
+    Log("[watchdog] snapshot: detector=%s reason='%s' rip=%s rsp=%s rbp=%s",
+        detector, reason ? reason : "", ripText, rspText, rbpText);
+
+    if (!stackOk || bytesRead < sizeof(uintptr_t)) {
+        Log("[watchdog] snapshot: stack sample unavailable (gle=%u)", rpmGle);
+        return;
+    }
+
+    const size_t count = bytesRead / sizeof(uintptr_t);
+    size_t shown = 0;
+    for (size_t i = 0; i < count && shown < 8; ++i) {
+        uintptr_t candidate = stackQwords[i];
+        if (candidate < 0x10000)
+            continue;
+
+        char addrText[128] = {0};
+        if (!HangWatchdog_FormatModuleOffset(candidate, addrText, sizeof(addrText)))
+            continue;
+
+        Log("[watchdog] snapshot: ret[%zu]=%s", shown, addrText);
+        ++shown;
+    }
+    Log("[watchdog] snapshot: stack-bytes=%zu candidate-rets=%zu",
+        static_cast<size_t>(bytesRead), shown);
+}
+
 // Take the configured action for a detected hang. Shared by both the window
 // hang path and the heartbeat-stale path.
 static void HangWatchdog_TakeAction(const char* reason) {
+    HangWatchdog_LogMainThreadSnapshot(reason);
     Log("[watchdog] taking action=%s -- reason: %s",
         HangActionName(g_hangAction), reason);
     if (g_hangAction == kHangAction_Dump ||
