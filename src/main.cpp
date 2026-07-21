@@ -633,6 +633,11 @@ static constexpr uint32_t  kMovementJobCrashInsnLenC = 5;
 // Same movement-controller job-thread stale-object race family.
 static constexpr uintptr_t kMovementJobCrashOffsetD = 0x0CF7895;
 static constexpr uint32_t  kMovementJobCrashInsnLenD = 4;
+// New 2026-07-21 variant from CrashLogger:
+//   SkyrimSE.exe+0x0CF78A7 : lock xadd [rdx], rax with RDX invalid
+// Same movement-controller/water-collision stale-object race family.
+static constexpr uintptr_t kMovementJobCrashOffsetE = 0x0CF78A7;
+static constexpr uint32_t  kMovementJobCrashInsnLenE = 5;
 
 // The BSJobs::JobThread work-item dispatcher lives in this range. Frames
 // here are the ones we want to unwind to: the dispatcher treats a returning
@@ -660,6 +665,7 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
     // checks to avoid swallowing unrelated AVs in nearby code.
     bool matchedSite = false;
     uint32_t matchedInsnLen = 0;
+    bool matchedCmpSite = false;
 
     if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetA) {
         // Site A: cmp qword ptr [rcx+0x1F8], 0 with RCX=0.
@@ -667,6 +673,7 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenA;
+        matchedCmpSite = true;
     } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetB) {
         // Site B: add rcx, [rdi] with RDI=0.
         if (ctx->Rdi != 0)
@@ -684,12 +691,21 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenC;
+        matchedCmpSite = true;
     } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetD) {
         // Site D: mov rax, [rdi+0x18] with RDI=0.
         if (ctx->Rdi != 0)
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenD;
+    } else if (ctx->Rip == g_baseAddr + kMovementJobCrashOffsetE) {
+        // Site E: lock xadd [rdx], rax. Match only write AV at [rdx].
+        if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 1)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (static_cast<uintptr_t>(rec->ExceptionInformation[1]) != ctx->Rdx)
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenE;
     }
 
     if (!matchedSite)
@@ -723,10 +739,11 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         return AbsorbAndReturn(kHS_MovementJob);
     }
 
-    // Fallback: skip the faulting instruction and bias flags toward the
-    // caller's "null/missing field" path. For cmp sites this means ZF=1.
+    // Fallback: skip the faulting instruction. Only cmp sites get ZF=1 to
+    // bias callers toward "null/missing field" branches.
     ctx->Rip    += matchedInsnLen;
-    ctx->EFlags |= 0x40u;  // set ZF
+    if (matchedCmpSite)
+        ctx->EFlags |= 0x40u;  // set ZF
     ctx->Rax     = 0;
     return AbsorbAndReturn(kHS_MovementJob);
 }
