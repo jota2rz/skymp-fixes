@@ -238,12 +238,13 @@ enum HandlerSlot {
     kHS_MovementJob     = 3,
     kHS_JobMemcpy       = 4,
     kHS_MountCamera     = 5,
+    kHS_WaterPhysicsNull = 6,
     kHS_Count
 };
 
 static const char* const kHandlerNames[kHS_Count] = {
     "FaceGen", "WorldClean", "TextureQueue", "MovementJob",
-    "JobMemcpy", "MountCamera"
+    "JobMemcpy", "MountCamera", "WaterPhysicsNull"
 };
 
 static volatile LONG g_handlerFires[kHS_Count]      = {0};
@@ -821,6 +822,50 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
         ctx->EFlags |= 0x40u;  // set ZF
     ctx->Rax     = 0;
     return AbsorbAndReturn(kHS_MovementJob);
+}
+
+// ===========================================================================
+// FIX 9: WaterPhysics Null-Call Fix (main-thread BGSWaterCollisionManager)
+// ===========================================================================
+// 2026-07-22: main thread crashes at RIP=0 (execute AV) while updating water
+// collision. BGSWaterCollisionManager::bhkPlaceableWater+0x28 loaded a null
+// vtable pointer (stale actor despawned by SkyMP). Return address at RSP[0]
+// lands in SkyrimSE.exe+051D000..+051F000 (water-collision update area).
+// Recovery: RIP=[RSP], RSP+=8, RAX=0.
+
+static constexpr uintptr_t kWaterPhysicsCallAreaStart = 0x051D000;
+static constexpr uintptr_t kWaterPhysicsCallAreaEnd   = 0x051F000;
+
+static LONG CALLBACK WaterPhysicsNullCallHandler(EXCEPTION_POINTERS* a_ex) {
+    const auto* rec = a_ex->ExceptionRecord;
+    auto*       ctx = a_ex->ContextRecord;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ctx->Rip != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (rec->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (rec->ExceptionInformation[0] != 8)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (rec->ExceptionInformation[1] != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    uintptr_t retAddr = 0;
+    __try {
+        retAddr = *reinterpret_cast<uintptr_t*>(ctx->Rsp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (retAddr < g_baseAddr + kWaterPhysicsCallAreaStart ||
+        retAddr >= g_baseAddr + kWaterPhysicsCallAreaEnd)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    ctx->Rip  = retAddr;
+    ctx->Rsp += 8;
+    ctx->Rax  = 0;
+    return AbsorbAndReturn(kHS_WaterPhysicsNull);
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2361,8 +2406,9 @@ __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* a_skse) {
     AddVectoredExceptionHandler(1, TextureQueueExceptionHandler);
     AddVectoredExceptionHandler(1, MovementJobExceptionHandler);
     AddVectoredExceptionHandler(1, JobMemcpyExceptionHandler);
+    AddVectoredExceptionHandler(1, WaterPhysicsNullCallHandler);
     Log("[boot] Crash-fix exception handlers installed (FaceGen, WorldClean, "
-        "TextureQueue, MovementJob, JobMemcpy).");
+        "TextureQueue, MovementJob, JobMemcpy, WaterPhysicsNull).");
 
     // Diagnostic stats thread -- reports which handlers are firing and
     // flags likely livelocks. Cheap; low priority; auto-exits after 1h.
