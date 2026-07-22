@@ -650,6 +650,11 @@ static constexpr uint32_t  kMovementJobCrashInsnLenF = 7;
 // Same movement-controller stale-object race family.
 static constexpr uintptr_t kMovementJobCrashOffsetG = 0x0CF7E62;
 static constexpr uint32_t  kMovementJobCrashInsnLenG = 9;
+// New 2026-07-22 variant from CrashLogger:
+//   SkyrimSE.exe+0x0CF61BC : mov rcx, [rcx] with RCX=0
+// Same BSJobs::JobThread movement-controller race, early dispatch path.
+static constexpr uintptr_t kMovementJobCrashOffsetH = 0x0CF61BC;
+static constexpr uint32_t  kMovementJobCrashInsnLenH = 3;
 
 // The BSJobs::JobThread work-item dispatcher lives in this range. Frames
 // here are the ones we want to unwind to: the dispatcher treats a returning
@@ -663,7 +668,8 @@ static bool IsInJobThreadDispatcher(uintptr_t addr, uintptr_t baseAddr,
     // at +0xCF813E and +0xCF78A7 (both inside the same BSJobs::JobThread
     // dispatcher function). A generous +0xCF6000..+0xCF9000 covers the
     // whole dispatcher including future sites we haven't seen yet.
-    return off >= 0x00CF6000 && off <= 0x00CF9000;
+    // Widened again 2026-07-22 to cover outer dispatcher at +0xCD0DBD.
+    return off >= 0x00CD0000 && off <= 0x00CF9000;
 }
 
 // Water-collision movement path where execute-null variants have been seen
@@ -779,6 +785,16 @@ static LONG CALLBACK MovementJobExceptionHandler(EXCEPTION_POINTERS* a_ex) {
             return EXCEPTION_CONTINUE_SEARCH;
         matchedSite = true;
         matchedInsnLen = kMovementJobCrashInsnLenG;
+    } else if (!matchedSite && ctx->Rip == g_baseAddr + kMovementJobCrashOffsetH) {
+        // Site H: mov rcx, [rcx] with RCX=0. Read AV at address 0.
+        if (ctx->Rcx != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (static_cast<uintptr_t>(rec->ExceptionInformation[1]) != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        matchedSite = true;
+        matchedInsnLen = kMovementJobCrashInsnLenH;
     }
 
     if (!matchedSite)
