@@ -1578,8 +1578,11 @@ static HWND                 g_gameWindow         = nullptr;
 // over from a previous session (e.g. a game that crashed) cannot trigger
 // an immediate false positive on the next launch.
 static DWORD                g_heartbeatStaleSec  = 10;      // 0 disables
-static char                 g_heartbeatPath[MAX_PATH]   = {0};
-static char                 g_dumpTriggerPath[MAX_PATH] = {0};
+static char                 g_heartbeatPath[MAX_PATH] = {0};
+// Demand-dump hotkey (parsed from INI at startup).
+// Modifiers: bit 0 = Ctrl, bit 1 = Alt, bit 2 = Shift.
+static DWORD                g_dumpHotkeyMods  = 0;  // 0 = disabled
+static int                  g_dumpHotkeyVKey  = 0;  // VK code
 static bool                 g_heartbeatSeen      = false;   // true once we've
                                                             // seen a fresh
                                                             // (post-startup)
@@ -1826,6 +1829,47 @@ static void PruneOldDumpFilesInPluginDir(size_t keepNewestCount) {
         dumps.size(), keepNewestCount, deleted);
 }
 
+// Parse a hotkey string like "CTRL+ALT+F11" into modifier bits and VKey.
+// Returns false if the string is empty / "none" / unparseable.
+static bool ParseDumpHotkey(const char* s, DWORD* mods, int* vkey) {
+    if (!s || !*s) return false;
+    char buf[64] = {0};
+    std::strncpy(buf, s, sizeof(buf) - 1);
+    // Upper-case in place
+    for (char* p = buf; *p; ++p)
+        if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 32);
+    if (std::strcmp(buf, "NONE") == 0 || !*buf) return false;
+
+    DWORD m = 0; int k = 0;
+    char* tok = buf;
+    char* next = nullptr;
+    while (tok && *tok) {
+        next = std::strchr(tok, '+');
+        if (next) *next = '\0';
+        // Trim leading spaces
+        while (*tok == ' ') ++tok;
+        if (std::strcmp(tok, "CTRL")  == 0 || std::strcmp(tok, "CONTROL") == 0) { m |= 1; }
+        else if (std::strcmp(tok, "ALT")  == 0) { m |= 2; }
+        else if (std::strcmp(tok, "SHIFT") == 0) { m |= 4; }
+        else {
+            // Key name -> VK code
+            if (tok[0] == 'F' && tok[1] >= '1' && tok[1] <= '9') {
+                int n = std::atoi(tok + 1);
+                if (n >= 1 && n <= 12) k = VK_F1 + (n - 1);
+            } else if (std::strlen(tok) == 1 && *tok >= 'A' && *tok <= 'Z') {
+                k = (int)*tok; // 'A'..'Z' == VK_A..VK_Z
+            } else if (std::strlen(tok) == 1 && *tok >= '0' && *tok <= '9') {
+                k = (int)*tok; // '0'..'9' == VK_0..VK_9
+            }
+            // Ignore unrecognised keys
+        }
+        tok = next ? next + 1 : nullptr;
+    }
+    if (k == 0) return false;
+    *mods = m; *vkey = k;
+    return true;
+}
+
 static const char* HangActionName(HangAction a) {
     switch (a) {
         case kHangAction_Log:         return "log";
@@ -2048,8 +2092,14 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
         HangActionName(g_hangAction));
     if (g_heartbeatPath[0])
         Log("[watchdog] heartbeat file: %s", g_heartbeatPath);
-    if (g_dumpTriggerPath[0])
-        Log("[watchdog] demand-dump trigger: %s", g_dumpTriggerPath);
+    if (g_dumpHotkeyVKey)
+        Log("[watchdog] demand-dump hotkey: %s%s%s + VK 0x%02X",
+            (g_dumpHotkeyMods & 1) ? "CTRL+" : "",
+            (g_dumpHotkeyMods & 2) ? "ALT+"  : "",
+            (g_dumpHotkeyMods & 4) ? "SHIFT+": "",
+            g_dumpHotkeyVKey);
+    else
+        Log("[watchdog] demand-dump hotkey: disabled");
 
     constexpr DWORD kPollMs = 2000;
     const DWORD ticksNeeded = (g_hangThresholdSec * 1000u) / kPollMs;
@@ -2069,12 +2119,21 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
             return 0;
         }
 
-        // --- Demand-dump trigger ---
-        if (g_dumpTriggerPath[0] &&
-            GetFileAttributesA(g_dumpTriggerPath) != INVALID_FILE_ATTRIBUTES) {
-            DeleteFileA(g_dumpTriggerPath);
-            Log("[watchdog] demand-dump triggered -- writing dump.");
-            HangWatchdog_WriteDump();
+        // --- Demand-dump hotkey ---
+        if (g_dumpHotkeyVKey) {
+            static bool s_hotkeyWasDown = false;
+            bool ctrlOk  = !(g_dumpHotkeyMods & 1) || (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+            bool altOk   = !(g_dumpHotkeyMods & 2) || (GetAsyncKeyState(VK_MENU)    & 0x8000);
+            bool shiftOk = !(g_dumpHotkeyMods & 4) || (GetAsyncKeyState(VK_SHIFT)   & 0x8000);
+            bool keyDown = (GetAsyncKeyState(g_dumpHotkeyVKey) & 0x8000) != 0;
+            bool combo   = ctrlOk && altOk && shiftOk && keyDown;
+            if (combo && !s_hotkeyWasDown) {
+                s_hotkeyWasDown = true;
+                Log("[watchdog] demand-dump hotkey pressed -- writing dump.");
+                HangWatchdog_WriteDump();
+            } else if (!combo) {
+                s_hotkeyWasDown = false;
+            }
         }
 
         // --- Detector A: window message pump stuck ---
@@ -2318,6 +2377,14 @@ static void InstallHangWatchdog() {
     if (recoveryGraceSec > 60) recoveryGraceSec = 60;
     g_recoveryGraceSec = (DWORD)recoveryGraceSec;
 
+    char hotkeyStr[64] = {0};
+    GetPrivateProfileStringA("HangWatchdog", "DumpHotkey", "CTRL+ALT+F11",
+                             hotkeyStr, sizeof(hotkeyStr), g_iniPath);
+    if (!ParseDumpHotkey(hotkeyStr, &g_dumpHotkeyMods, &g_dumpHotkeyVKey))
+        Log("[watchdog] DumpHotkey '%s' not recognised -- demand-dump disabled.", hotkeyStr);
+    else
+        Log("[watchdog] DumpHotkey='%s' parsed ok.", hotkeyStr);
+
     // Compute the heartbeat file path. memprofile.js writes it to
     // <SkyrimDir>\Data\Platform\SkyMPFixes.heartbeat; we're at
     // <SkyrimDir>\Data\SKSE\Plugins so back up two levels.
@@ -2348,8 +2415,6 @@ static void InstallHangWatchdog() {
         }
         std::snprintf(g_heartbeatPath, MAX_PATH,
                       "%s\\Data\\Platform\\SkyMPFixes.heartbeat", skyrimDir);
-        std::snprintf(g_dumpTriggerPath, MAX_PATH,
-                      "%s\\SkyMPFixes.dump_now", g_dllDir);
     }
 
     // Resolve IsHungAppWindow (user32). It's been there since Windows XP,
