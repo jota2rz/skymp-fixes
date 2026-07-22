@@ -1578,7 +1578,8 @@ static HWND                 g_gameWindow         = nullptr;
 // over from a previous session (e.g. a game that crashed) cannot trigger
 // an immediate false positive on the next launch.
 static DWORD                g_heartbeatStaleSec  = 10;      // 0 disables
-static char                 g_heartbeatPath[MAX_PATH] = {0};
+static char                 g_heartbeatPath[MAX_PATH]   = {0};
+static char                 g_dumpTriggerPath[MAX_PATH] = {0};
 static bool                 g_heartbeatSeen      = false;   // true once we've
                                                             // seen a fresh
                                                             // (post-startup)
@@ -2047,6 +2048,8 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
         HangActionName(g_hangAction));
     if (g_heartbeatPath[0])
         Log("[watchdog] heartbeat file: %s", g_heartbeatPath);
+    if (g_dumpTriggerPath[0])
+        Log("[watchdog] demand-dump trigger: %s", g_dumpTriggerPath);
 
     constexpr DWORD kPollMs = 2000;
     const DWORD ticksNeeded = (g_hangThresholdSec * 1000u) / kPollMs;
@@ -2064,6 +2067,14 @@ static DWORD WINAPI HangWatchdogThread(LPVOID) {
         if (!IsWindow(g_gameWindow)) {
             Log("[watchdog] game window closed -- watchdog exiting.");
             return 0;
+        }
+
+        // --- Demand-dump trigger ---
+        if (g_dumpTriggerPath[0] &&
+            GetFileAttributesA(g_dumpTriggerPath) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA(g_dumpTriggerPath);
+            Log("[watchdog] demand-dump triggered -- writing dump.");
+            HangWatchdog_WriteDump();
         }
 
         // --- Detector A: window message pump stuck ---
@@ -2337,6 +2348,8 @@ static void InstallHangWatchdog() {
         }
         std::snprintf(g_heartbeatPath, MAX_PATH,
                       "%s\\Data\\Platform\\SkyMPFixes.heartbeat", skyrimDir);
+        std::snprintf(g_dumpTriggerPath, MAX_PATH,
+                      "%s\\SkyMPFixes.dump_now", g_dllDir);
     }
 
     // Resolve IsHungAppWindow (user32). It's been there since Windows XP,
